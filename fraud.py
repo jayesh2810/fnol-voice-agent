@@ -211,6 +211,61 @@ TRANSCRIPT
 """
 
 
+_CORE_EVENT = re.compile(
+    r"\b(hit|struck|collid|crash|ran (over|into)|rear[- ]end|from behind|front|side[- ]?swipe|pedestrian|cyclist|"
+    r"stopped|stationary|parked|driving|moving|turning|reversing|red light|green light|who (hit|was driving)|"
+    r"sequence|order of events|first|then)\b", re.I)
+
+
+def _touches_core_event(item: dict) -> bool:
+    text = item.get("explanation", "") + " " + " ".join(item.get("caller_quotes", []))
+    return bool(_CORE_EVENT.search(text))
+
+
+# --- Recap versus first account: a direct, narrow comparison ------------------
+
+_RECAP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "compatible": {"type": "boolean"},
+        "core_event_changed": {"type": "boolean"},
+        "explanation": {"type": "string"},
+    },
+    "required": ["compatible", "core_event_changed", "explanation"],
+}
+
+
+def compare_recap(fields: dict) -> dict | None:
+    """Ask one narrow question: can the first account and the recap both be true?
+
+    Returns a finding dict, or None when they agree (or when either is missing).
+    """
+    from guava.helpers.llm import generate
+
+    first, recap = fields.get("description"), fields.get("timeline_recap")
+    if not first or not recap:
+        return None
+    prompt = f"""Two descriptions of the same car accident, given by the same caller a few minutes apart.
+
+FIRST ACCOUNT: {first}
+RECAP: {recap}
+
+Can both be true at the same time? Adding detail (a colour, a name, a street, the light being red)
+is compatible. Set compatible=false only if a fact in one rules out a fact in the other.
+Set core_event_changed=true if the disagreement is about who hit whom, the direction of impact,
+whether the caller's car was moving or stopped, who else was involved, or the order of events.
+Explain in one sentence."""
+    try:
+        data = json.loads(generate(prompt, json_schema=_RECAP_SCHEMA))
+    except Exception:
+        logger.exception("Recap comparison failed")
+        return None
+    if data.get("compatible", True):
+        return None
+    severity = "high" if data.get("core_event_changed") else "medium"
+    return _finding("llm", "recap_conflicts_with_account", severity, data.get("explanation", ""), [first, recap])
+
+
 def run_llm_review(policy: dict, fields: dict, transcript: list[dict], probes: list[dict] | None = None) -> tuple[list[dict], list[dict], date | None, str, bool]:
     """Returns (findings, dropped, incident_date, summary, succeeded)."""
     from guava.helpers.llm import generate  # imported here so tests can stub it
@@ -228,7 +283,10 @@ def run_llm_review(policy: dict, fields: dict, transcript: list[dict], probes: l
             continue
         # A "contradiction" or "changed story" only counts if the model itself says the two
         # statements cannot both be true. Extra detail on a recap is not a finding.
-        if item["category"] in ("contradiction", "changed_story") and not item.get("incompatible", True):
+        # Exception: anything about the core event (who hit whom, direction, sequence) is
+        # never dropped, whatever the flag says.
+        if (item["category"] in ("contradiction", "changed_story") and not item.get("incompatible", True)
+                and not _touches_core_event(item)):
             logger.info("Dropping compatible story finding: %s", item["explanation"])
             dropped.append(_finding("llm", item["category"], item["severity"], item["explanation"], item.get("caller_quotes", [])))
             continue
@@ -410,6 +468,16 @@ def analyze(policy: dict, fields: dict, transcript: list[dict], probes: list[dic
 
     incident_date = parse_date(fields.get("incident_date")) or llm_incident_date
     rule_findings = run_rules(policy, fields, incident_date)
+
+    recap_finding = compare_recap(fields) if llm_ok else None
+    if recap_finding:
+        # The direct comparison wins; drop transcript findings that quote the recap so the
+        # same clash is not counted twice.
+        recap_text = _loose(fields.get("timeline_recap") or "")
+        llm_findings = [x for x in llm_findings
+                        if x["code"] not in ("changed_story", "contradiction")
+                        or not any(_loose(q) and _loose(q) in recap_text for q in x["quotes"])]
+        llm_findings.append(recap_finding)
 
     findings = rule_findings + llm_findings
     if not llm_ok:

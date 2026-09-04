@@ -423,6 +423,8 @@ def run_live_check(call: guava.Call, state: CallState, line_index: int) -> None:
             if len(state.probes) >= MAX_PROBES_PER_CALL or line_index - state.last_probe_line < PROBE_COOLDOWN_LINES:
                 recompute_live(call, state, line_index)
                 return
+            if state.phase != "intake":
+                return  # the account closed while the check was running; too late to ask
             state.probes.append({**result, "time": _now(), "resolved": False})
             state.last_probe_line = line_index
         add_ledger(state, line_index, result["points"], "live", result["kind"], result["reason"], provisional=True)
