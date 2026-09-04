@@ -37,6 +37,7 @@ from guava.events import AgentSpeechEvent, BotSessionEnded, CallerSpeechEvent
 
 from fraud import analyze, check_turn, live_rules, live_total
 from policies import verify_identity
+from redact import redact, redact_fields
 
 logger = logging.getLogger("fnol_agent")
 
@@ -101,7 +102,10 @@ agent = guava.Agent(
         "Verify who you are speaking to before discussing anything about a policy. "
         "Collect the facts without leading the caller or suggesting answers. "
         "Never accuse the caller of anything, never mention fraud, risk, review, "
-        "or suspicion, and never explain which verification detail was wrong."
+        "or suspicion, and never explain which verification detail was wrong. "
+        "If the caller offers payment card "
+        "or bank details, say nothing is charged on this call, ask them not to share "
+        "those details, and do not repeat them."
     ),
 )
 
@@ -278,6 +282,7 @@ def on_intake_complete(call: guava.Call):
     state = _state(call)
     for key in INTAKE_FIELDS:
         state.fields[key] = call.get_field(key)
+    state.fields = redact_fields(state.fields)
 
     # Keep the caller informed while the analysis runs (it takes a few seconds).
     call.send_instruction("Let the caller know you're just saving the details and it will take a moment.")
@@ -327,11 +332,11 @@ def on_caller_speech(call: guava.Call, event: CallerSpeechEvent):
     # The SDK may send a corrected version of the same utterance; keep the latest.
     if (state.transcript and event.utterance_id
             and state.transcript[-1].get("utterance_id") == event.utterance_id):
-        state.transcript[-1]["text"] = event.utterance
+        state.transcript[-1]["text"] = redact(event.utterance)
         publish_live(state)
         return
     state.transcript.append({
-        "i": len(state.transcript), "role": "caller", "text": event.utterance,
+        "i": len(state.transcript), "role": "caller", "text": redact(event.utterance),
         "time": _now(), "utterance_id": event.utterance_id,
     })
     recompute_live(call, state, line=len(state.transcript) - 1, publish=False)
@@ -410,7 +415,7 @@ def run_live_check(call: guava.Call, state: CallState, line_index: int) -> None:
 def on_agent_speech(call: guava.Call, event: AgentSpeechEvent):
     state = _state(call)
     state.transcript.append({
-        "i": len(state.transcript), "role": "agent", "text": event.utterance,
+        "i": len(state.transcript), "role": "agent", "text": redact(event.utterance),
         "time": _now(), "interrupted": event.interrupted,
     })
     # Collected answers usually land just before the agent's next line, so check the rules here too.
