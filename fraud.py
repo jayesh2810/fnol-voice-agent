@@ -1,0 +1,324 @@
+"""Fraud-signal analysis for a First Notice of Loss call.
+
+Two layers, run after the caller has told their story:
+
+1. RULES  - plain Python checks on hard facts (policy dates, status, claim
+            history, vehicle on file). Cheap, deterministic, easy to explain.
+2. LLM    - one call to Guava's hosted model that reads the whole transcript
+            and lists contradictions or evasive answers, quoting the caller's
+            exact words. Catches story-level problems the rules can't see.
+
+Both layers produce "findings". Findings are weighted into a 0-100 risk
+score, and the score decides whether the claim is filed now or held for a
+human reviewer. The caller is never told about any of this.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from datetime import date
+
+from policies import parse_date
+
+logger = logging.getLogger("fnol_agent.fraud")
+
+# --- Tunables ----------------------------------------------------------------
+
+RECENT_POLICY_DAYS = 30      # incident this soon after policy start is worth a look
+MAX_PRIOR_CLAIMS_12M = 1     # more than this many claims in a year is worth a look
+
+RISK_MEDIUM = 30             # score >= this -> "medium"
+RISK_HIGH = 60               # score >= this -> "high" -> hold the claim
+
+SEVERITY_WEIGHT = {"low": 10, "medium": 20, "high": 60}  # one "high" holds the claim on its own
+
+
+# Every rule, with the sentence shown when it does NOT fire. The dashboard uses
+# this to show the checks that passed, so a reviewer sees what was verified,
+# not only what went wrong.
+RULE_CATALOG = {
+    "policy_not_active": "Policy is active",
+    "incident_before_policy_start": "Incident happened after the policy started",
+    "recent_policy": f"Policy was more than {RECENT_POLICY_DAYS} days old at the incident",
+    "incident_in_future": "Incident date is not in the future",
+    "incident_date_unclear": "Incident date was understood",
+    "claim_frequency": f"No more than {MAX_PRIOR_CLAIMS_12M} prior claim(s) in 12 months",
+    "vehicle_mismatch": "Vehicle described matches the vehicle on file",
+    "injuries_without_police_report": "No injuries reported without police involvement",
+    "liability_only_coverage": "Coverage includes damage to the caller's own vehicle",
+}
+
+
+def _finding(source: str, code: str, severity: str, explanation: str, quotes: list[str] | None = None) -> dict:
+    return {
+        "source": source,            # "rule" or "llm"
+        "code": code,                # short machine-readable label
+        "severity": severity,        # low | medium | high
+        "weight": SEVERITY_WEIGHT[severity],
+        "explanation": explanation,  # one sentence a human reviewer can read
+        "quotes": quotes or [],      # verbatim caller lines that support it
+    }
+
+
+# --- Layer 1: rules ----------------------------------------------------------
+
+def _normalize(text: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def run_rules(policy: dict, fields: dict, incident_date: date | None) -> list[dict]:
+    findings: list[dict] = []
+    today = date.today()
+    policy_start = date.fromisoformat(policy["policy_start"])
+
+    if policy["status"] != "active":
+        findings.append(_finding(
+            "rule", "policy_not_active", "high",
+            f"Policy status is '{policy['status']}'"
+            + (f" since {policy['lapsed_on']}" if policy.get("lapsed_on") else "")
+            + "; no cover was in force.",
+        ))
+
+    if incident_date is not None:
+        if incident_date > today:
+            findings.append(_finding(
+                "rule", "incident_in_future", "medium",
+                f"Stated incident date {incident_date} is in the future; likely misheard, needs confirming.",
+            ))
+        elif incident_date < policy_start:
+            findings.append(_finding(
+                "rule", "incident_before_policy_start", "high",
+                f"Incident date {incident_date} is before the policy started on {policy_start}.",
+            ))
+        elif (incident_date - policy_start).days <= RECENT_POLICY_DAYS:
+            days = (incident_date - policy_start).days
+            findings.append(_finding(
+                "rule", "recent_policy", "medium",
+                f"Incident occurred only {days} day(s) after the policy started on {policy_start}.",
+            ))
+    else:
+        findings.append(_finding(
+            "rule", "incident_date_unclear", "low",
+            f"Could not turn the stated incident date '{fields.get('incident_date')}' into a real date.",
+        ))
+
+    if policy["prior_claims_12m"] > MAX_PRIOR_CLAIMS_12M:
+        findings.append(_finding(
+            "rule", "claim_frequency", "medium",
+            f"{policy['prior_claims_12m']} prior claims in the last 12 months.",
+        ))
+
+    vehicle = policy["vehicle"]
+    spoken_vehicle = _normalize(fields.get("vehicle"))
+    on_file = [_normalize(vehicle["make"]), _normalize(vehicle["model"]), _normalize(vehicle["plate"])]
+    if spoken_vehicle and not any(part and part in spoken_vehicle for part in on_file):
+        findings.append(_finding(
+            "rule", "vehicle_mismatch", "medium",
+            f"Caller described '{fields.get('vehicle')}' but the policy covers a "
+            f"{vehicle['year']} {vehicle['make']} {vehicle['model']} (plate {vehicle['plate']}).",
+        ))
+
+    if str(fields.get("injuries", "")).lower() == "yes" and str(fields.get("police_report", "")).lower() == "no":
+        findings.append(_finding(
+            "rule", "injuries_without_police_report", "low",
+            "Injuries reported but no police involvement; unusual for an injury accident.",
+        ))
+
+    if policy["coverage"] == "liability_only":
+        findings.append(_finding(
+            "rule", "liability_only_coverage", "low",
+            "Policy is liability-only; damage to the caller's own vehicle is not covered. Adjuster to confirm what is being claimed.",
+        ))
+
+    return findings
+
+
+# --- Layer 2: LLM transcript review -------------------------------------------
+
+_LLM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "incident_date_iso": {"type": ["string", "null"]},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": ["contradiction", "changed_story", "vague_or_evasive", "implausible_detail", "other"]},
+                    "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "incompatible": {"type": "boolean"},
+                    "explanation": {"type": "string"},
+                    "caller_quotes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["category", "severity", "incompatible", "explanation", "caller_quotes"],
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["incident_date_iso", "findings", "summary"],
+}
+
+
+def _build_prompt(policy: dict, fields: dict, transcript: list[dict]) -> str:
+    lines = "\n".join(f"{t['role'].upper()}: {t['text']}" for t in transcript)
+    vehicle = policy["vehicle"]
+    return f"""You are a claims-review analyst for an auto insurer. Read the transcript of a
+First Notice of Loss phone call and look for signs that the caller's story is not consistent.
+
+Be conservative. The caller has just had an accident and may be stressed, so small slips,
+approximate times, or hesitation are NOT findings on their own. Adding a new detail in the
+recap that was simply not mentioned before (a traffic light colour, the weather, a street name)
+is NOT a finding either; only report the recap if it is INCOMPATIBLE with the first account.
+Only report things a careful human reviewer would want to look at:
+- the caller states two incompatible facts (date, location, who was driving, sequence of events)
+- the story changes materially when they are asked to recap it
+- they avoid or deflect a direct question more than once
+- a detail is physically or logically implausible
+
+For each finding set "incompatible" to true ONLY if the quoted statements cannot both be
+true at the same time. A recap that adds a colour, a name, or a street is compatible with the
+first account, so incompatible is false and it should not be reported at all.
+
+Report each inconsistency ONCE, under the single best category; never list the same
+pair of statements twice. Only report what the caller actually said. Do not speculate about
+what "could" or "might" have been true (for example, who else may have been present).
+
+For every finding, copy the caller's exact words that support it into caller_quotes
+(verbatim substrings of CALLER lines only). If the transcript is consistent, return an
+empty findings list and say so in the summary.
+
+Also convert the stated incident date to ISO format (YYYY-MM-DD) in incident_date_iso.
+Today's date is {date.today().isoformat()}. Use null if you cannot tell.
+
+POLICY ON FILE
+- Holder: {policy['holder_name']}
+- Vehicle: {vehicle['year']} {vehicle['make']} {vehicle['model']}, plate {vehicle['plate']}
+- Policy start: {policy['policy_start']}, status: {policy['status']}, coverage: {policy['coverage']}
+
+ANSWERS THE AGENT RECORDED
+{json.dumps(fields, indent=2)}
+
+TRANSCRIPT
+{lines}
+"""
+
+
+def run_llm_review(policy: dict, fields: dict, transcript: list[dict]) -> tuple[list[dict], list[dict], date | None, str, bool]:
+    """Returns (findings, dropped, incident_date, summary, succeeded)."""
+    from guava.helpers.llm import generate  # imported here so tests can stub it
+
+    try:
+        raw = generate(_build_prompt(policy, fields, transcript), json_schema=_LLM_SCHEMA)
+        data = json.loads(raw)
+    except Exception as exc:  # network, auth, or bad JSON
+        logger.exception("LLM transcript review failed")
+        return [], [], None, f"LLM review failed: {exc}", False
+
+    findings, dropped = [], []
+    for item in data.get("findings", []):
+        if item.get("severity") not in SEVERITY_WEIGHT:
+            continue
+        # A "contradiction" or "changed story" only counts if the model itself says the two
+        # statements cannot both be true. Extra detail on a recap is not a finding.
+        if item["category"] in ("contradiction", "changed_story") and not item.get("incompatible", True):
+            logger.info("Dropping compatible story finding: %s", item["explanation"])
+            dropped.append(_finding("llm", item["category"], item["severity"], item["explanation"], item.get("caller_quotes", [])))
+            continue
+        findings.append(_finding("llm", item["category"], item["severity"], item["explanation"], item.get("caller_quotes", [])))
+    incident_date = parse_date(data.get("incident_date_iso"))
+    return findings, dropped, incident_date, data.get("summary", ""), True
+
+
+# --- Scoring and transcript highlighting -------------------------------------
+
+def score_findings(findings: list[dict]) -> tuple[int, str]:
+    total = min(100, sum(f["weight"] for f in findings))
+    if total >= RISK_HIGH:
+        return total, "high"
+    if total >= RISK_MEDIUM:
+        return total, "medium"
+    return total, "low"
+
+
+def _loose(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+
+
+def highlight_transcript(transcript: list[dict], findings: list[dict]) -> list[dict]:
+    """Mark which caller lines the findings point at, so a dashboard can highlight them.
+
+    Each transcript entry gets a "flags" list of finding indexes.
+    """
+    out = []
+    for entry in transcript:
+        flags: list[int] = []
+        if entry["role"] == "caller":
+            line = _loose(entry["text"])
+            for idx, finding in enumerate(findings):
+                for quote in finding["quotes"]:
+                    q = _loose(quote)
+                    if len(q) >= 8 and (q in line or (len(line) >= 8 and line in q)):
+                        flags.append(idx)
+                        break
+        out.append({**entry, "flags": flags})
+    return out
+
+
+def compare_policy_to_statements(policy: dict, fields: dict, incident_date: date | None) -> list[dict]:
+    """Side-by-side of what the policy says versus what the caller said."""
+    v = policy["vehicle"]
+    spoken_vehicle = _normalize(fields.get("vehicle"))
+    vehicle_ok = any(_normalize(p) in spoken_vehicle for p in (v["make"], v["model"], v["plate"])) if spoken_vehicle else None
+    start = date.fromisoformat(policy["policy_start"])
+    date_ok = None if incident_date is None else (start <= incident_date <= date.today())
+    return [
+        {"label": "Vehicle", "on_file": f"{v['year']} {v['make']} {v['model']}, plate {v['plate']}",
+         "stated": fields.get("vehicle") or "", "ok": vehicle_ok},
+        {"label": "Incident date", "on_file": f"policy started {policy['policy_start']}",
+         "stated": incident_date.isoformat() if incident_date else str(fields.get("incident_date") or ""), "ok": date_ok},
+        {"label": "Policy status", "on_file": policy["status"] + (f" since {policy['lapsed_on']}" if policy.get("lapsed_on") else ""),
+         "stated": "claim being filed", "ok": policy["status"] == "active"},
+        {"label": "Claims in last 12 months", "on_file": str(policy["prior_claims_12m"]),
+         "stated": "new claim", "ok": policy["prior_claims_12m"] <= MAX_PRIOR_CLAIMS_12M},
+        {"label": "Coverage", "on_file": policy["coverage"].replace("_", " "),
+         "stated": fields.get("damage") or "", "ok": policy["coverage"] != "liability_only"},
+    ]
+
+
+# --- Entry point -------------------------------------------------------------
+
+def analyze(policy: dict, fields: dict, transcript: list[dict]) -> dict:
+    """Run both layers and produce the report saved next to the claim."""
+    llm_findings, dropped, llm_incident_date, summary, llm_ok = run_llm_review(policy, fields, transcript)
+
+    incident_date = parse_date(fields.get("incident_date")) or llm_incident_date
+    rule_findings = run_rules(policy, fields, incident_date)
+
+    findings = rule_findings + llm_findings
+    if not llm_ok:
+        # We could not do the story-level check, so a human must look at it.
+        findings.append(_finding("rule", "llm_review_unavailable", "high",
+                                 "Automated transcript review did not run; manual review required."))
+
+    score, level = score_findings(findings)
+    decision = "hold_for_review" if level == "high" else "file"
+
+    fired = {f["code"] for f in findings}
+    checks = [{"code": code, "passed": code not in fired, "label": label} for code, label in RULE_CATALOG.items()]
+
+    return {
+        "checks": checks,          # every rule, passed or not
+        "dropped": dropped,        # LLM findings judged compatible; did not change the score
+        "comparison": compare_policy_to_statements(policy, fields, incident_date),
+        "score": score,
+        "level": level,
+        "decision": decision,
+        "incident_date": incident_date.isoformat() if incident_date else None,
+        "findings": findings,
+        "llm_summary": summary,
+        "llm_review_ok": llm_ok,
+        "thresholds": {"medium": RISK_MEDIUM, "high": RISK_HIGH},
+        "transcript": highlight_transcript(transcript, findings),
+    }
