@@ -46,6 +46,7 @@ RULE_CATALOG = {
     "incident_date_unclear": "Incident date was understood",
     "claim_frequency": f"No more than {MAX_PRIOR_CLAIMS_12M} prior claim(s) in 12 months",
     "vehicle_mismatch": "Vehicle described matches the vehicle on file",
+    "plate_mismatch": "Licence plate stated matches the plate on file",
     "injuries_without_police_report": "No injuries reported without police involvement",
     "liability_only_coverage": "Coverage includes damage to the caller's own vehicle",
 }
@@ -66,6 +67,29 @@ def _finding(source: str, code: str, severity: str, explanation: str, quotes: li
 
 def _normalize(text: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+_PLATE_AFTER_WORD = re.compile(r"(?:licen[cs]e\s*)?(?:plate|registration|reg)\s*(?:number|no\.?|is|was|:)?\s*((?:[A-Za-z0-9][\s\-]?){4,9})", re.I)
+_PLATE_TOKEN = re.compile(r"\b(?=[A-Z0-9\-]*[A-Z])(?=[A-Z0-9\-]*\d)[A-Z0-9\-]{5,8}\b")
+
+
+def stated_plate(text: str | None) -> str | None:
+    """Pull a licence plate out of what the caller said, or None if they did not give one."""
+    if not text:
+        return None
+    m = _PLATE_AFTER_WORD.search(text)
+    if m:
+        cand = re.sub(r"[^A-Z0-9]", "", m.group(1).upper())
+        if 4 <= len(cand) <= 9:
+            return cand
+    m = _PLATE_TOKEN.search(text.upper())
+    return re.sub(r"[^A-Z0-9]", "", m.group(0)) if m else None
+
+
+def _chars_differ(a: str, b: str) -> int:
+    if len(a) != len(b):
+        return abs(len(a) - len(b)) + sum(x != y for x, y in zip(a, b))
+    return sum(x != y for x, y in zip(a, b))
 
 
 def run_rules(policy: dict, fields: dict, incident_date: date | None) -> list[dict]:
@@ -118,6 +142,17 @@ def run_rules(policy: dict, fields: dict, incident_date: date | None) -> list[di
             "rule", "vehicle_mismatch", "medium",
             f"Caller described '{fields.get('vehicle')}' but the policy covers a "
             f"{vehicle['year']} {vehicle['make']} {vehicle['model']} (plate {vehicle['plate']}).",
+        ))
+
+    plate_said = stated_plate(fields.get("vehicle"))
+    plate_on_file = _normalize(vehicle["plate"]).upper()
+    if plate_said and plate_said != plate_on_file:
+        diff = _chars_differ(plate_said, plate_on_file)
+        findings.append(_finding(
+            "rule", "plate_mismatch", "medium",
+            f"Caller gave plate {plate_said}; the plate on file is {vehicle['plate']} "
+            f"({diff} character{'s' if diff != 1 else ''} different"
+            + ("; could be a mishearing, needs confirming" if diff <= 2 else "") + ").",
         ))
 
     if str(fields.get("injuries", "")).lower() == "yes" and str(fields.get("police_report", "")).lower() == "no":
@@ -446,9 +481,13 @@ def compare_policy_to_statements(policy: dict, fields: dict, incident_date: date
     vehicle_ok = any(_normalize(p) in spoken_vehicle for p in (v["make"], v["model"], v["plate"])) if spoken_vehicle else None
     start = date.fromisoformat(policy["policy_start"])
     date_ok = None if incident_date is None else (start <= incident_date <= date.today())
+    plate_said = stated_plate(fields.get("vehicle"))
+    plate_ok = None if not plate_said else plate_said == _normalize(v["plate"]).upper()
     return [
-        {"label": "Vehicle", "on_file": f"{v['year']} {v['make']} {v['model']}, plate {v['plate']}",
+        {"label": "Vehicle", "on_file": f"{v['year']} {v['make']} {v['model']}",
          "stated": fields.get("vehicle") or "", "ok": vehicle_ok},
+        {"label": "Licence plate", "on_file": v["plate"],
+         "stated": plate_said or "(not stated)", "ok": plate_ok},
         {"label": "Incident date", "on_file": f"policy started {policy['policy_start']}",
          "stated": incident_date.isoformat() if incident_date else str(fields.get("incident_date") or ""), "ok": date_ok},
         {"label": "Policy status", "on_file": policy["status"] + (f" since {policy['lapsed_on']}" if policy.get("lapsed_on") else ""),

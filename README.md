@@ -62,6 +62,7 @@ also heavily regulated, so a person makes that call, never the bot.
 | `recent_policy` | medium | incident within 30 days of policy start |
 | `claim_frequency` | medium | more than 1 claim in the last 12 months |
 | `vehicle_mismatch` | medium | described vehicle doesn't match make, model or plate on file |
+| `plate_mismatch` | medium | a plate was stated and it differs from the plate on file (notes how many characters differ) |
 | `injuries_without_police_report` | low | injuries reported but no police involvement |
 | `liability_only_coverage` | low | own-vehicle damage isn't covered; adjuster to confirm |
 | `llm_review_unavailable` | high | the LLM check didn't run, so a human must |
