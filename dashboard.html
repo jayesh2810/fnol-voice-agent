@@ -33,7 +33,9 @@
   .score .num { font-size: 34px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
   .score .num small { font-size: 13px; color: var(--ink-3); font-weight: 400; }
   .bar { position: relative; height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
-  .bar .fill { height: 100%; width: 0; background: var(--good); transition: width .4s; }
+  .bar .fill { height: 100%; width: 0; background: var(--good); transition: width .4s; position: absolute; left: 0; top: 0; }
+  .bar .prov { position: absolute; top: 0; height: 100%; width: 0; transition: left .4s, width .4s; background: repeating-linear-gradient(135deg, var(--warn) 0 4px, transparent 4px 8px); opacity: .85; }
+  .score.high .prov { background: repeating-linear-gradient(135deg, var(--crit) 0 4px, transparent 4px 8px); }
   .bar .t { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ink-3); opacity: .6; }
   .score .lvl { font-size: 12px; margin-top: 3px; }
   .score.low .fill { background: var(--good); } .score.medium .fill { background: var(--warn); } .score.high .fill { background: var(--crit); }
@@ -69,6 +71,15 @@
   .chip.dropped { color: var(--ink-3); border-style: dashed; }
   .sys { text-align: center; color: var(--ink-3); font-size: 12px; margin: 14px 0; }
   .sys b { color: var(--ink-2); }
+  .moves { display: flex; gap: 6px; flex-wrap: wrap; margin: -4px 0 12px 66px; }
+  .move { font-size: 11.5px; font-weight: 700; padding: 2px 8px; border-radius: 10px; font-variant-numeric: tabular-nums; }
+  .move.up { background: var(--crit-soft); color: var(--crit); }
+  .move.prov { background: var(--warn-soft); color: var(--warn); border: 1px dashed var(--warn); }
+  .move.down { background: var(--good-soft); color: var(--good); }
+  .ledger { font-size: 13px; }
+  .ledger div { display: grid; grid-template-columns: 52px 1fr 44px; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--rule); align-items: baseline; }
+  .ledger .d { font-weight: 700; font-variant-numeric: tabular-nums; } .ledger .d.up { color: var(--crit); } .ledger .d.prov { color: var(--warn); } .ledger .d.down { color: var(--good); } .ledger .d.final { color: var(--accent); }
+  .ledger .tot { text-align: right; color: var(--ink-3); font-variant-numeric: tabular-nums; }
   .sys.probe { text-align: left; margin: 4px 0 12px 66px; max-width: 70ch; padding: 8px 12px; background: var(--warn-soft); color: var(--ink-2); border-radius: 6px; font-size: 13px; }
 
   /* side panel */
@@ -109,7 +120,7 @@
   </div>
   <div id="score" class="score">
     <div><div class="num"><span id="scoreNum">–</span><small> / 100</small></div><div id="scoreLvl" class="lvl">no score yet</div></div>
-    <div><div class="bar"><div id="fill" class="fill"></div><div class="t" style="left:30%"></div><div class="t" style="left:60%"></div></div>
+    <div><div class="bar"><div id="fill" class="fill"></div><div id="prov" class="prov"></div><div class="t" style="left:30%"></div><div class="t" style="left:60%"></div></div>
       <div class="lbl" style="display:flex;justify-content:space-between;margin-top:4px"><span>low</span><span>30 medium</span><span>60 hold</span></div></div>
   </div>
   <div style="display:flex;gap:8px;align-items:center">
@@ -122,6 +133,7 @@
   <section class="transcript" id="transcript"><div class="empty">No call yet. Start the agent and the conversation will appear here as it happens.</div></section>
   <aside>
     <div id="verdict"></div>
+    <div id="ledgerPanel" hidden><h2>How the score moved</h2><div id="ledger" class="ledger"></div></div>
     <div id="probesPanel" hidden><h2>Follow-ups asked during the call</h2><div id="probes"></div></div>
     <div><h2>What moved the score</h2><div id="findings"><div class="summary">The score is computed when the caller finishes their account. Until then this panel stays empty.</div></div></div>
     <div><h2>Policy on file vs. what the caller said</h2><div id="comparison"><div class="summary">Available after verification.</div></div></div>
@@ -187,10 +199,18 @@
     const ph = $("phase"); ph.textContent = live ? "Live · " + (PHASES[d.phase] || d.phase) : (PHASES[d.phase] || "Ended"); ph.className = "pill" + (live ? " live" : "");
     const st = $("status"); st.hidden = !STATUS[d.status]; st.textContent = STATUS[d.status] || ""; st.className = "pill " + d.status;
     $("claim").textContent = d.claim_number || "";
-    const sc = $("score"); sc.className = "score " + (risk.level || "");
-    $("scoreNum").textContent = risk.score == null ? "–" : risk.score;
-    $("fill").style.width = (risk.score || 0) + "%";
-    $("scoreLvl").textContent = risk.level ? `${risk.level} risk · ${risk.decision === "hold_for_review" ? "hold for a human" : "file the claim"}` : (d.phase === "analyzing" ? "scoring…" : "no score yet");
+    const lv = d.live || {}; const ledger = lv.ledger || [];
+    const showFinal = risk.score != null;
+    const sc = $("score"); sc.className = "score " + (showFinal ? (risk.level || "") : (lv.level || "low"));
+    if (showFinal) {
+      $("scoreNum").textContent = risk.score; $("fill").style.width = risk.score + "%"; $("prov").style.width = "0";
+      $("scoreLvl").textContent = `${risk.level} risk · ${risk.decision === "hold_for_review" ? "hold for a human" : "file the claim"}`;
+    } else {
+      $("scoreNum").textContent = d.policy ? (lv.score || 0) : "–";
+      $("fill").style.width = (lv.confirmed || 0) + "%";
+      $("prov").style.left = (lv.confirmed || 0) + "%"; $("prov").style.width = Math.min(100 - (lv.confirmed || 0), lv.provisional || 0) + "%";
+      $("scoreLvl").textContent = d.phase === "analyzing" ? "final review running…" : d.policy ? `live estimate · ${lv.level || "low"}${lv.provisional ? ` · ${lv.provisional} provisional` : ""}` : "no score yet";
+    }
 
     // map transcript line -> findings (by index) and dropped findings (by quote match)
     const byLine = {}; (d.transcript || []).forEach(t => byLine[t.i] = (t.flags || []).slice());
@@ -208,6 +228,8 @@
         + dl.map(k => `<span class="chip dropped" title="${esc(dropped[k].explanation)}">noted, not counted</span>`).join("");
       html += `<div class="line ${t.role}" data-i="${t.i}"><div class="who">${t.role}</div><div class="${cls}">${esc(t.text)}${chips ? `<div class="chips">${chips}</div>` : ""}</div></div>`;
       (d.probes || []).filter(p => p.line === t.i).forEach(p => { html += `<div class="sys probe">👀 <b>Follow-up asked</b> (${esc(p.kind)}): ${esc(p.reason)}<br><i>“${esc(p.question)}”</i></div>`; });
+      const moves = ledger.filter(e => e.line === t.i && e.kind !== "final");
+      if (moves.length) html += `<div class="moves">${moves.map(e => `<span class="move ${e.delta < 0 ? "down" : e.provisional ? "prov" : "up"}">${e.delta > 0 ? "+" : ""}${e.delta} ${esc(e.kind === "cleared" ? "cleared up" : e.code.replace(/_/g, " "))}</span>`).join("")}</div>`;
       // marker between verification and intake
       if (d.transcript.indexOf(t) === firstIntakeIndex(d) - 1 && d.policy) html += `<div class="sys">Identity verified as <b>${esc(d.policy.holder_name)}</b></div>`;
     });
@@ -215,6 +237,12 @@
     if (d.phase === "ended") html += `<div class="sys">Call ended · <b>${STATUS[d.status] || d.status}</b>${d.saved_as ? " · saved as " + esc(d.saved_as) : ""}</div>`;
     box.innerHTML = html || '<div class="empty">Connected. Waiting for the first words…</div>';
     if (live && (atBottom || isNew)) box.scrollTop = box.scrollHeight;
+
+    // score ledger
+    $("ledgerPanel").hidden = !ledger.length;
+    let run = 0;
+    $("ledger").innerHTML = ledger.map(e => { run = Math.max(0, Math.min(100, run + e.delta)); const cls = e.kind === "final" ? "final" : e.delta < 0 ? "down" : e.provisional ? "prov" : "up";
+      return `<div><span class="d ${cls}">${e.delta > 0 ? "+" : ""}${e.delta}</span><span>${esc(e.label)}${e.provisional ? " <i>(provisional)</i>" : ""}</span><span class="tot">${run}</span></div>`; }).join("");
 
     // live follow-ups
     const probes = d.probes || [];

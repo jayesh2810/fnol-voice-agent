@@ -141,6 +141,13 @@ Python standard library.
   judged compatible and counted for nothing, and every rule that passed.
 - **Policy vs. statements** shows the vehicle, incident date, policy status,
   claim history and coverage side by side, with mismatches in red.
+- **The score moves during the call.** Solid points come from rule checks the
+  moment their facts are collected (a lapsed policy shows at verification, a
+  vehicle mismatch the moment the car is described). Striped points come from
+  the live check and are taken back when a follow-up is answered clearly. Each
+  change appears as a tag under the line that caused it and in a running ledger.
+  The final review replaces the estimate when the account is complete; the
+  file-or-hold decision is made only from that final score.
 - **Follow-ups asked live** appear in the transcript under the line that
   triggered them, with the reason, and in their own panel on the right.
 - **Past calls** can be picked from the dropdown in the header.
