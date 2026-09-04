@@ -72,6 +72,17 @@ extra API key is needed. It is told to be conservative and to quote the
 caller's exact words for every finding. Categories: `contradiction`,
 `changed_story`, `vague_or_evasive`, `implausible_detail`, `other`.
 
+**Layer 2b: live follow-ups** (`fraud.py`, `check_turn`, wired in `main.py`).
+While the caller gives their account, each new caller line is checked in the
+background against everything said so far. If the line is too vague to act on
+or cannot be true alongside an earlier statement, the agent is nudged to ask
+one neutral, factual follow-up before moving on, for example "Just so I have
+it right, was that on Tuesday or on Wednesday?". Limits, all at the top of
+`main.py`: at most 2 follow-ups per call, never within 3 lines of the last
+one, never during identity checks, and the feature can be switched off with
+one flag. Every follow-up is recorded with its reason, and the end-of-call
+review is told about them so a clear correction counts in the caller's favour.
+
 **Scoring.** low = 10, medium = 20, high = 60 points per finding, capped at 100.
 Score 30+ is medium, 60+ is high. So one high finding holds the claim on its own, and it takes three mediums to do the same. Thresholds live at the top of `fraud.py`.
 
@@ -130,6 +141,8 @@ Python standard library.
   judged compatible and counted for nothing, and every rule that passed.
 - **Policy vs. statements** shows the vehicle, incident date, policy status,
   claim history and coverage side by side, with mismatches in red.
+- **Follow-ups asked live** appear in the transcript under the line that
+  triggered them, with the reason, and in their own panel on the right.
 - **Past calls** can be picked from the dropdown in the header.
 
 How it works: the agent writes `claims/live.json` after every spoken line
@@ -180,8 +193,8 @@ One file per call in `claims/`. Shape:
 
 - Speech-to-text can mishear names and dates. Name matching is fuzzy and dates are
   parsed leniently, but a real deployment would confirm by reading back.
-- The LLM review is one shot at the end of the call. A version two could run it after
-  each answer and let the agent ask a gentle clarifying question in the moment.
+- The live follow-up check costs one helper-model call per caller line during the
+  account. Fine for a prototype; a production version would batch or throttle it.
 - Fake data lives in a Python dictionary. Swap `find_policy` for a real API call.
 - Guava's hosted LLM endpoint is convenient for a prototype. For production in a
   regulated setting you would confirm where that data is processed and retained.

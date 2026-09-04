@@ -161,9 +161,14 @@ _LLM_SCHEMA = {
 }
 
 
-def _build_prompt(policy: dict, fields: dict, transcript: list[dict]) -> str:
+def _build_prompt(policy: dict, fields: dict, transcript: list[dict], probes: list[dict] | None = None) -> str:
     lines = "\n".join(f"{t['role'].upper()}: {t['text']}" for t in transcript)
     vehicle = policy["vehicle"]
+    probe_note = ""
+    if probes:
+        probe_note = "\nFOLLOW-UP QUESTIONS THE AGENT ASKED DURING THE CALL\n" + "\n".join(
+            f"- after line {p['line']} ({p['kind']}): {p['question']}" for p in probes
+        ) + "\nIf the caller's answer to a follow-up clearly resolved the concern, treat it as compatible and do not report it.\n"
     return f"""You are a claims-review analyst for an auto insurer. Read the transcript of a
 First Notice of Loss phone call and look for signs that the caller's story is not consistent.
 
@@ -200,17 +205,18 @@ POLICY ON FILE
 ANSWERS THE AGENT RECORDED
 {json.dumps(fields, indent=2)}
 
+{probe_note}
 TRANSCRIPT
 {lines}
 """
 
 
-def run_llm_review(policy: dict, fields: dict, transcript: list[dict]) -> tuple[list[dict], list[dict], date | None, str, bool]:
+def run_llm_review(policy: dict, fields: dict, transcript: list[dict], probes: list[dict] | None = None) -> tuple[list[dict], list[dict], date | None, str, bool]:
     """Returns (findings, dropped, incident_date, summary, succeeded)."""
     from guava.helpers.llm import generate  # imported here so tests can stub it
 
     try:
-        raw = generate(_build_prompt(policy, fields, transcript), json_schema=_LLM_SCHEMA)
+        raw = generate(_build_prompt(policy, fields, transcript, probes), json_schema=_LLM_SCHEMA)
         data = json.loads(raw)
     except Exception as exc:  # network, auth, or bad JSON
         logger.exception("LLM transcript review failed")
@@ -229,6 +235,78 @@ def run_llm_review(policy: dict, fields: dict, transcript: list[dict]) -> tuple[
         findings.append(_finding("llm", item["category"], item["severity"], item["explanation"], item.get("caller_quotes", [])))
     incident_date = parse_date(data.get("incident_date_iso"))
     return findings, dropped, incident_date, data.get("summary", ""), True
+
+
+# --- Layer 2b: live "eyebrow" check, one caller line at a time ---------------
+# Runs during the call, right after the caller says something. It looks only at
+# the newest line against what came before and, if something is vague or does
+# not fit, hands back ONE neutral follow-up question for the agent to ask.
+
+_TURN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "suspicious": {"type": "boolean"},
+        "kind": {"type": "string", "enum": ["none", "vague", "contradiction"]},
+        "reason": {"type": "string"},
+        "follow_up_question": {"type": "string"},
+    },
+    "required": ["suspicious", "kind", "reason", "follow_up_question"],
+}
+
+
+def _build_turn_prompt(policy: dict, fields: dict, transcript: list[dict], latest: dict) -> str:
+    earlier = "\n".join(f"{t['role'].upper()}: {t['text']}" for t in transcript if t["i"] < latest["i"])
+    v = policy["vehicle"]
+    return f"""You are listening in on a live insurance claims call. Judge ONLY the caller's newest line.
+
+Decide whether it deserves one gentle follow-up question right now. Say suspicious=true only if:
+- it is so vague that a claims handler could not act on it ("somewhere downtown", "it's complicated",
+  "I'd rather not say") when a specific answer was asked for, OR
+- it cannot both be true together with something the caller said EARLIER on this call.
+
+Do NOT flag: short answers that are still specific ("no", "yes", "around 6pm"), approximate times,
+missing detail that was not asked for, nervous or informal phrasing, or an answer that simply adds
+new information. When in doubt, suspicious=false. Most lines are fine.
+
+If suspicious, write ONE follow-up question the agent can ask in a warm, neutral tone. It must ask
+for a fact (which day, which street, which car) and must never say or imply the caller is wrong or
+suspected. Good: "Just so I have it right, was that on Tuesday or on Wednesday?" Bad: "You said
+something different before."
+
+POLICY ON FILE: {policy['holder_name']}, {v['year']} {v['make']} {v['model']} plate {v['plate']}, started {policy['policy_start']}.
+ANSWERS RECORDED SO FAR: {json.dumps({k: val for k, val in fields.items() if k not in ('date_of_birth',)})}
+
+EARLIER LINES
+{earlier or '(none yet)'}
+
+NEWEST CALLER LINE
+{latest['text']}
+"""
+
+
+def check_turn(policy: dict, fields: dict, transcript: list[dict], latest: dict) -> dict | None:
+    """Return a follow-up suggestion for the newest caller line, or None if it is fine.
+
+    Any failure (network, bad JSON) returns None: a live check must never disturb the call.
+    """
+    from guava.helpers.llm import generate
+
+    try:
+        raw = generate(_build_turn_prompt(policy, fields, transcript, latest), json_schema=_TURN_SCHEMA)
+        data = json.loads(raw)
+    except Exception:
+        logger.exception("Live turn check failed")
+        return None
+    if not data.get("suspicious") or data.get("kind") not in ("vague", "contradiction"):
+        return None
+    if not data.get("follow_up_question", "").strip():
+        return None
+    return {
+        "line": latest["i"],
+        "kind": data["kind"],
+        "reason": data.get("reason", ""),
+        "question": data["follow_up_question"].strip(),
+    }
 
 
 # --- Scoring and transcript highlighting -------------------------------------
@@ -289,9 +367,9 @@ def compare_policy_to_statements(policy: dict, fields: dict, incident_date: date
 
 # --- Entry point -------------------------------------------------------------
 
-def analyze(policy: dict, fields: dict, transcript: list[dict]) -> dict:
+def analyze(policy: dict, fields: dict, transcript: list[dict], probes: list[dict] | None = None) -> dict:
     """Run both layers and produce the report saved next to the claim."""
-    llm_findings, dropped, llm_incident_date, summary, llm_ok = run_llm_review(policy, fields, transcript)
+    llm_findings, dropped, llm_incident_date, summary, llm_ok = run_llm_review(policy, fields, transcript, probes)
 
     incident_date = parse_date(fields.get("incident_date")) or llm_incident_date
     rule_findings = run_rules(policy, fields, incident_date)

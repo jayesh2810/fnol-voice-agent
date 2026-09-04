@@ -69,6 +69,7 @@
   .chip.dropped { color: var(--ink-3); border-style: dashed; }
   .sys { text-align: center; color: var(--ink-3); font-size: 12px; margin: 14px 0; }
   .sys b { color: var(--ink-2); }
+  .sys.probe { text-align: left; margin: 4px 0 12px 66px; max-width: 70ch; padding: 8px 12px; background: var(--warn-soft); color: var(--ink-2); border-radius: 6px; font-size: 13px; }
 
   /* side panel */
   .finding { border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; background: var(--panel); }
@@ -121,6 +122,7 @@
   <section class="transcript" id="transcript"><div class="empty">No call yet. Start the agent and the conversation will appear here as it happens.</div></section>
   <aside>
     <div id="verdict"></div>
+    <div id="probesPanel" hidden><h2>Follow-ups asked during the call</h2><div id="probes"></div></div>
     <div><h2>What moved the score</h2><div id="findings"><div class="summary">The score is computed when the caller finishes their account. Until then this panel stays empty.</div></div></div>
     <div><h2>Policy on file vs. what the caller said</h2><div id="comparison"><div class="summary">Available after verification.</div></div></div>
     <div><h2>Collected answers</h2><div id="fields" class="kv"></div></div>
@@ -205,6 +207,7 @@
       const chips = fl.map(i => `<span class="chip ${sevOf(findings[i] || {})}" data-f="${i}">+${(findings[i] || {}).weight || 0} ${(findings[i] || {}).code || ""}</span>`).join("")
         + dl.map(k => `<span class="chip dropped" title="${esc(dropped[k].explanation)}">noted, not counted</span>`).join("");
       html += `<div class="line ${t.role}" data-i="${t.i}"><div class="who">${t.role}</div><div class="${cls}">${esc(t.text)}${chips ? `<div class="chips">${chips}</div>` : ""}</div></div>`;
+      (d.probes || []).filter(p => p.line === t.i).forEach(p => { html += `<div class="sys probe">👀 <b>Follow-up asked</b> (${esc(p.kind)}): ${esc(p.reason)}<br><i>“${esc(p.question)}”</i></div>`; });
       // marker between verification and intake
       if (d.transcript.indexOf(t) === firstIntakeIndex(d) - 1 && d.policy) html += `<div class="sys">Identity verified as <b>${esc(d.policy.holder_name)}</b></div>`;
     });
@@ -212,6 +215,11 @@
     if (d.phase === "ended") html += `<div class="sys">Call ended · <b>${STATUS[d.status] || d.status}</b>${d.saved_as ? " · saved as " + esc(d.saved_as) : ""}</div>`;
     box.innerHTML = html || '<div class="empty">Connected. Waiting for the first words…</div>';
     if (live && (atBottom || isNew)) box.scrollTop = box.scrollHeight;
+
+    // live follow-ups
+    const probes = d.probes || [];
+    $("probesPanel").hidden = !probes.length;
+    $("probes").innerHTML = probes.map(p => `<div class="finding ${p.kind === "contradiction" ? "medium" : "low"}"><div class="head"><span><span class="code">${esc(p.kind)}</span><span class="src">live · line ${p.line}</span></span><span class="delta">asked</span></div><p>${esc(p.reason)}</p><div class="q">“${esc(p.question)}”</div></div>`).join("");
 
     // verdict + findings
     $("verdict").innerHTML = risk.llm_summary ? `<div class="summary"><b>Transcript review:</b> ${esc(risk.llm_summary)}</div>` : "";

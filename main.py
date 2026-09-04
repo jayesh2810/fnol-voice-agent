@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,13 +35,19 @@ import guava
 from guava import logging_utils
 from guava.events import AgentSpeechEvent, BotSessionEnded, CallerSpeechEvent
 
-from fraud import analyze
+from fraud import analyze, check_turn
 from policies import verify_identity
 
 logger = logging.getLogger("fnol_agent")
 
 CLAIMS_DIR = Path(__file__).resolve().parent / "claims"
 MAX_VERIFY_RETRIES = 1  # one second chance, then end the call
+
+# Live "eyebrow" checks during the accident account (see fraud.check_turn).
+LIVE_CHECKS = True            # set False to switch the feature off
+MAX_PROBES_PER_CALL = 2       # follow-up questions the agent may ask on its own
+PROBE_COOLDOWN_LINES = 3      # never probe again within this many caller lines
+TURN_SETTLE_SECONDS = 0.8     # wait for the speech system to finish correcting a line
 
 
 # --- Per-call memory ---------------------------------------------------------
@@ -61,6 +68,10 @@ class CallState:
     fields: dict = field(default_factory=dict)
     transcript: list[dict] = field(default_factory=list)
     analysis: dict | None = None
+    probes: list[dict] = field(default_factory=list)   # follow-ups asked live, and why
+    last_probe_line: int = -100
+    _timer: threading.Timer | None = None                # pending live check for the newest line
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 CALLS: dict[str, CallState] = {}
@@ -267,10 +278,12 @@ def on_intake_complete(call: guava.Call):
     # Keep the caller informed while the analysis runs (it takes a few seconds).
     call.send_instruction("Let the caller know you're just saving the details and it will take a moment.")
     state.phase = "analyzing"
+    if state._timer:
+        state._timer.cancel()
     publish_live(state)
 
     try:
-        state.analysis = analyze(state.policy, state.fields, state.transcript)
+        state.analysis = analyze(state.policy, state.fields, list(state.transcript), state.probes)
     except Exception:
         logger.exception("Analysis crashed; holding the claim for a human")
         state.analysis = {"score": None, "level": "unknown", "decision": "hold_for_review",
@@ -317,6 +330,57 @@ def on_caller_speech(call: guava.Call, event: CallerSpeechEvent):
         "time": _now(), "utterance_id": event.utterance_id,
     })
     publish_live(state)
+    schedule_live_check(call, state)
+
+
+# --- Live suspicion: raise an eyebrow, ask one follow-up ----------------------
+# After each caller line during the accident account, a background check asks
+# the helper model whether the line is vague or contradicts something earlier.
+# If so, the agent is nudged to ask one neutral follow-up before moving on.
+# The check runs off the event thread so the conversation is never held up.
+
+def schedule_live_check(call: guava.Call, state: CallState) -> None:
+    if not LIVE_CHECKS or state.phase != "intake" or state.policy is None:
+        return
+    if len(state.probes) >= MAX_PROBES_PER_CALL:
+        return
+    line = state.transcript[-1]
+    if line["i"] - state.last_probe_line < PROBE_COOLDOWN_LINES:
+        return
+    # The speech system may still revise this line; wait a moment, then check the final text.
+    if state._timer:
+        state._timer.cancel()
+    state._timer = threading.Timer(TURN_SETTLE_SECONDS, run_live_check, args=(call, state, line["i"]))
+    state._timer.daemon = True
+    state._timer.start()
+
+
+def run_live_check(call: guava.Call, state: CallState, line_index: int) -> None:
+    try:
+        if state.phase != "intake" or len(state.probes) >= MAX_PROBES_PER_CALL:
+            return
+        snapshot = list(state.transcript)
+        latest = next((t for t in snapshot if t["i"] == line_index), None)
+        if latest is None or latest["role"] != "caller":
+            return
+        fields_so_far = {k: call.get_field(k) for k in INTAKE_FIELDS if call.has_field(k)}
+        result = check_turn(state.policy, fields_so_far, snapshot, latest)
+        if result is None:
+            return
+        with state._lock:
+            if len(state.probes) >= MAX_PROBES_PER_CALL or line_index - state.last_probe_line < PROBE_COOLDOWN_LINES:
+                return
+            state.probes.append({**result, "time": _now()})
+            state.last_probe_line = line_index
+        logger.info("Eyebrow raised at line %d (%s): %s -> asking: %s", line_index, result["kind"], result["reason"], result["question"])
+        call.send_instruction(
+            "Before moving on to the next item, ask this one follow-up question in a warm, neutral "
+            f"tone, exactly once: \"{result['question']}\" Do not say or imply that anything the "
+            "caller said was wrong or inconsistent. Accept whatever they answer and continue."
+        )
+        publish_live(state)
+    except Exception:
+        logger.exception("Live check failed; ignoring")
 
 
 @agent.on_agent_speech
@@ -393,6 +457,7 @@ def build_record(state: CallState, termination_reason: str | None = None) -> dic
         },
         "policy": policy_public,
         "fields": state.fields,
+        "probes": state.probes,
         "risk": {
             "score": analysis.get("score"),
             "level": analysis.get("level"),
