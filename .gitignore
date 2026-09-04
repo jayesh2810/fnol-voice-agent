@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+# Call records contain test-call transcripts; keep them local.
+claims/*.json
+claims/*.tmp
+
+# Scaffolded copy of the Guava docs; not used by this agent.
+guava-docs.md

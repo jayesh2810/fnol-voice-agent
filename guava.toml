@@ -1,0 +1,8 @@
+project_id = "gp-a9117900-b526-4832-891b-cb2f8b003632"
+org_id = "6a930e8705f8725f344e3198"
+name = "appointment-reminder"
+call_direction = "inbound"
+base_image = "python-sandbox:3.14"
+tier = "guava-seed"
+replicas = 1
+enable_healthcheck = true
