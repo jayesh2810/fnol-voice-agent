@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northwind Claims Review</title>
+<style>
+  :root {
+    --paper: #F4F6F5; --panel: #FFFFFF; --panel-2: #EDF0EE; --ink: #1B2632; --ink-2: #4B5865; --ink-3: #7C8893;
+    --rule: #D6DCD8; --accent: #0E6A85; --accent-soft: #DCEBF0;
+    --good: #2A6F47; --good-soft: #DDEDE3; --warn: #8F5A0A; --warn-soft: #F4E7CF; --crit: #A8342A; --crit-soft: #F3DCD8;
+    --agent-bubble: #FFFFFF; --caller-bubble: #DCEBF0;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  .lbl { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+
+  /* header */
+  header { display: grid; grid-template-columns: 1fr auto auto auto; gap: 24px; align-items: center; padding: 14px 24px; background: var(--panel); border-bottom: 1px solid var(--rule); }
+  header h1 { font-size: 17px; margin: 0; font-weight: 700; }
+  header h1 span { color: var(--ink-3); font-weight: 400; }
+  .status { display: flex; gap: 10px; align-items: center; }
+  .pill { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding: 4px 9px; border-radius: 4px; background: var(--panel-2); color: var(--ink-2); }
+  .pill.live { background: var(--crit-soft); color: var(--crit); }
+  .pill.live::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--crit); margin-right: 6px; animation: blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .pill.filed { background: var(--good-soft); color: var(--good); }
+  .pill.held_for_review { background: var(--crit-soft); color: var(--crit); }
+  .pill.unverified, .pill.abandoned { background: var(--warn-soft); color: var(--warn); }
+  .score { display: grid; grid-template-columns: auto 160px; gap: 12px; align-items: center; }
+  .score .num { font-size: 34px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .score .num small { font-size: 13px; color: var(--ink-3); font-weight: 400; }
+  .bar { position: relative; height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
+  .bar .fill { height: 100%; width: 0; background: var(--good); transition: width .4s; }
+  .bar .t { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ink-3); opacity: .6; }
+  .score .lvl { font-size: 12px; margin-top: 3px; }
+  .score.low .fill { background: var(--good); } .score.medium .fill { background: var(--warn); } .score.high .fill { background: var(--crit); }
+  .score.low .lvl { color: var(--good); } .score.medium .lvl { color: var(--warn); } .score.high .lvl { color: var(--crit); }
+  select { font: inherit; padding: 6px 8px; border: 1px solid var(--rule); border-radius: 4px; background: var(--panel); color: var(--ink); max-width: 320px; }
+  button { font: inherit; padding: 6px 10px; border: 1px solid var(--rule); border-radius: 4px; background: var(--panel); color: var(--accent); cursor: pointer; }
+  button:hover { background: var(--accent-soft); }
+
+  /* body layout */
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(360px, 2fr); gap: 0; height: calc(100% - 71px); }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; height: auto; } }
+  section.transcript { overflow-y: auto; padding: 20px 24px; }
+  aside { overflow-y: auto; border-left: 1px solid var(--rule); background: var(--panel); padding: 18px 20px; display: flex; flex-direction: column; gap: 22px; }
+  aside h2 { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); margin: 0 0 10px; font-weight: 700; }
+
+  /* transcript */
+  .empty { color: var(--ink-3); text-align: center; padding: 60px 0; }
+  .line { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 10px; margin-bottom: 10px; align-items: start; }
+  .line .who { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); padding-top: 9px; font-weight: 600; }
+  .bubble { position: relative; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--rule); background: var(--agent-bubble); max-width: 70ch; }
+  .line.caller .bubble { background: var(--caller-bubble); border-color: transparent; }
+  .line.caller { grid-template-columns: minmax(0, 1fr) 56px; }
+  .line.caller .who { text-align: right; order: 2; }
+  .line.caller .bubble { justify-self: end; }
+  .bubble.flag-low { box-shadow: inset 4px 0 0 var(--warn); border-color: var(--warn); }
+  .bubble.flag-medium { box-shadow: inset 4px 0 0 var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+  .bubble.flag-high { box-shadow: inset 4px 0 0 var(--crit); border-color: var(--crit); background: var(--crit-soft); }
+  .bubble.dropped { border-style: dashed; }
+  .bubble.focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .chip { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 3px; cursor: pointer; background: var(--panel); border: 1px solid var(--rule); color: var(--ink-2); }
+  .chip.high { color: var(--crit); border-color: var(--crit); } .chip.medium, .chip.low { color: var(--warn); border-color: var(--warn); }
+  .chip.dropped { color: var(--ink-3); border-style: dashed; }
+  .sys { text-align: center; color: var(--ink-3); font-size: 12px; margin: 14px 0; }
+  .sys b { color: var(--ink-2); }
+
+  /* side panel */
+  .finding { border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; background: var(--panel); }
+  .finding:hover, .finding.focus { border-color: var(--accent); }
+  .finding .head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .finding .code { font-weight: 700; font-size: 13px; }
+  .finding .delta { font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .finding.high .delta { color: var(--crit); } .finding.medium .delta, .finding.low .delta { color: var(--warn); }
+  .finding.passed .delta, .finding.dropped .delta { color: var(--ink-3); }
+  .finding.passed { border-color: transparent; background: var(--good-soft); cursor: default; }
+  .finding.passed .code { color: var(--good); font-weight: 600; }
+  .finding.dropped { border-style: dashed; }
+  .finding .src { font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .08em; margin-left: 6px; font-weight: 600; }
+  .finding p { margin: 5px 0 0; font-size: 13.5px; color: var(--ink-2); }
+  .finding .q { margin-top: 6px; font-size: 13px; font-style: italic; color: var(--ink); border-left: 2px solid var(--rule); padding-left: 8px; }
+  .summary { font-size: 13.5px; color: var(--ink-2); background: var(--panel-2); padding: 10px 12px; border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th { text-align: left; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); padding: 4px 6px; border-bottom: 1px solid var(--rule); }
+  td { padding: 7px 6px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  td.ok { color: var(--good); font-weight: 700; white-space: nowrap; }
+  td.bad { color: var(--crit); font-weight: 700; white-space: nowrap; }
+  tr.bad td { background: var(--crit-soft); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13.5px; }
+  .kv div:nth-child(odd) { color: var(--ink-3); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Northwind Claims Review <span>· FNOL intake</span></h1>
+    <div id="sub" class="lbl" style="margin-top:3px">Waiting for a call</div>
+  </div>
+  <div class="status">
+    <span id="phase" class="pill">Idle</span>
+    <span id="status" class="pill" hidden></span>
+    <span id="claim" class="mono" style="font-weight:700"></span>
+  </div>
+  <div id="score" class="score">
+    <div><div class="num"><span id="scoreNum">–</span><small> / 100</small></div><div id="scoreLvl" class="lvl">no score yet</div></div>
+    <div><div class="bar"><div id="fill" class="fill"></div><div class="t" style="left:30%"></div><div class="t" style="left:60%"></div></div>
+      <div class="lbl" style="display:flex;justify-content:space-between;margin-top:4px"><span>low</span><span>30 medium</span><span>60 hold</span></div></div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <select id="picker" title="Past calls"><option value="">Live call</option></select>
+    <button id="backLive" hidden>Back to live</button>
+  </div>
+</header>
+
+<main>
+  <section class="transcript" id="transcript"><div class="empty">No call yet. Start the agent and the conversation will appear here as it happens.</div></section>
+  <aside>
+    <div id="verdict"></div>
+    <div><h2>What moved the score</h2><div id="findings"><div class="summary">The score is computed when the caller finishes their account. Until then this panel stays empty.</div></div></div>
+    <div><h2>Policy on file vs. what the caller said</h2><div id="comparison"><div class="summary">Available after verification.</div></div></div>
+    <div><h2>Collected answers</h2><div id="fields" class="kv"></div></div>
+  </aside>
+</main>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  let following = true;        // true = show live.json; false = a past call was picked
+  let shownCallId = null;
+  let lastJson = "";
+  let focused = null;          // finding index currently highlighted
+
+  const PHASES = { verifying: "Verifying identity", intake: "Taking the account", analyzing: "Scoring the call", ended: "Call ended" };
+  const STATUS = { filed: "Filed", held_for_review: "Held for review", unverified: "Unverified", abandoned: "Abandoned", in_progress: "" };
+
+  async function poll() {
+    try {
+      if (following) {
+        const r = await fetch("/api/live", { cache: "no-store" });
+        const text = await r.text();
+        if (text !== lastJson) { lastJson = text; render(JSON.parse(text || "{}")); }
+      }
+      refreshPicker();
+    } catch (e) { /* server not up yet; try again */ }
+    setTimeout(poll, 1000);
+  }
+
+  let pickerSig = "";
+  async function refreshPicker() {
+    const rows = await (await fetch("/api/claims", { cache: "no-store" })).json();
+    const sig = rows.map(r => r.file).join("|");
+    if (sig === pickerSig) return;
+    pickerSig = sig;
+    const p = $("picker"); const cur = p.value;
+    p.innerHTML = '<option value="">Live call</option>' + rows.map(r =>
+      `<option value="${r.file}">${(r.started_at || "").replace("T", " ").slice(0, 16)} · ${r.holder || "unverified"} · ${STATUS[r.status] || r.status}${r.score != null ? " · " + r.score : ""}</option>`).join("");
+    p.value = cur;
+  }
+
+  $("picker").addEventListener("change", async (e) => {
+    if (!e.target.value) { following = true; lastJson = ""; $("backLive").hidden = true; return; }
+    following = false; $("backLive").hidden = false;
+    const d = await (await fetch("/api/claims/" + e.target.value, { cache: "no-store" })).json();
+    render(d);
+  });
+  $("backLive").addEventListener("click", () => { $("picker").value = ""; following = true; lastJson = ""; $("backLive").hidden = true; });
+
+  function sevOf(f) { return f.severity || "low"; }
+  function maxSev(list) { return list.includes("high") ? "high" : list.includes("medium") ? "medium" : "low"; }
+
+  function render(d) {
+    if (!d || !d.call_id) return;
+    const isNew = d.call_id !== shownCallId; shownCallId = d.call_id;
+    if (isNew) focused = null;
+    const risk = d.risk || {}; const findings = risk.findings || []; const dropped = risk.dropped || [];
+    const live = following && d.phase !== "ended";
+
+    // header
+    $("sub").textContent = `${d.policy ? d.policy.holder_name + " · policy " + d.policy.policy_number : "Caller not yet verified"} · started ${(d.started_at || "").replace("T", " ").slice(0, 19)}`;
+    const ph = $("phase"); ph.textContent = live ? "Live · " + (PHASES[d.phase] || d.phase) : (PHASES[d.phase] || "Ended"); ph.className = "pill" + (live ? " live" : "");
+    const st = $("status"); st.hidden = !STATUS[d.status]; st.textContent = STATUS[d.status] || ""; st.className = "pill " + d.status;
+    $("claim").textContent = d.claim_number || "";
+    const sc = $("score"); sc.className = "score " + (risk.level || "");
+    $("scoreNum").textContent = risk.score == null ? "–" : risk.score;
+    $("fill").style.width = (risk.score || 0) + "%";
+    $("scoreLvl").textContent = risk.level ? `${risk.level} risk · ${risk.decision === "hold_for_review" ? "hold for a human" : "file the claim"}` : (d.phase === "analyzing" ? "scoring…" : "no score yet");
+
+    // map transcript line -> findings (by index) and dropped findings (by quote match)
+    const byLine = {}; (d.transcript || []).forEach(t => byLine[t.i] = (t.flags || []).slice());
+    const droppedLines = {};
+    dropped.forEach((f, k) => (d.transcript || []).forEach(t => { if (t.role === "caller" && (f.quotes || []).some(q => loose(t.text).includes(loose(q)) || loose(q).includes(loose(t.text)))) (droppedLines[t.i] = droppedLines[t.i] || []).push(k); }));
+
+    // transcript
+    const box = $("transcript"); const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+    let html = "";
+    (d.transcript || []).forEach(t => {
+      const fl = byLine[t.i] || []; const dl = droppedLines[t.i] || [];
+      const sev = fl.length ? maxSev(fl.map(i => sevOf(findings[i] || {}))) : null;
+      const cls = ["bubble", sev ? "flag-" + sev : "", dl.length && !sev ? "dropped" : "", focused != null && fl.includes(focused) ? "focus" : ""].join(" ");
+      const chips = fl.map(i => `<span class="chip ${sevOf(findings[i] || {})}" data-f="${i}">+${(findings[i] || {}).weight || 0} ${(findings[i] || {}).code || ""}</span>`).join("")
+        + dl.map(k => `<span class="chip dropped" title="${esc(dropped[k].explanation)}">noted, not counted</span>`).join("");
+      html += `<div class="line ${t.role}" data-i="${t.i}"><div class="who">${t.role}</div><div class="${cls}">${esc(t.text)}${chips ? `<div class="chips">${chips}</div>` : ""}</div></div>`;
+      // marker between verification and intake
+      if (d.transcript.indexOf(t) === firstIntakeIndex(d) - 1 && d.policy) html += `<div class="sys">Identity verified as <b>${esc(d.policy.holder_name)}</b></div>`;
+    });
+    if (d.phase === "analyzing") html += `<div class="sys">Scoring the account…</div>`;
+    if (d.phase === "ended") html += `<div class="sys">Call ended · <b>${STATUS[d.status] || d.status}</b>${d.saved_as ? " · saved as " + esc(d.saved_as) : ""}</div>`;
+    box.innerHTML = html || '<div class="empty">Connected. Waiting for the first words…</div>';
+    if (live && (atBottom || isNew)) box.scrollTop = box.scrollHeight;
+
+    // verdict + findings
+    $("verdict").innerHTML = risk.llm_summary ? `<div class="summary"><b>Transcript review:</b> ${esc(risk.llm_summary)}</div>` : "";
+    let fh = "";
+    findings.forEach((f, i) => {
+      fh += `<div class="finding ${sevOf(f)} ${focused === i ? "focus" : ""}" data-f="${i}"><div class="head"><span><span class="code">${esc(f.code)}</span><span class="src">${f.source}</span></span><span class="delta">+${f.weight}</span></div><p>${esc(f.explanation)}</p>${(f.quotes || []).map(q => `<div class="q">“${esc(q)}”</div>`).join("")}</div>`;
+    });
+    dropped.forEach(f => {
+      fh += `<div class="finding dropped"><div class="head"><span><span class="code">${esc(f.category || f.code)}</span><span class="src">llm · compatible</span></span><span class="delta">+0</span></div><p>${esc(f.explanation)}</p></div>`;
+    });
+    (risk.checks || []).filter(c => c.passed).forEach(c => {
+      fh += `<div class="finding passed"><div class="head"><span class="code">✓ ${esc(c.label)}</span><span class="delta">+0</span></div></div>`;
+    });
+    if (risk.error) fh += `<div class="finding high"><div class="head"><span class="code">analysis error</span></div><p>${esc(risk.error)}</p></div>`;
+    $("findings").innerHTML = fh || (d.phase === "ended" ? '<div class="summary">No analysis for this call (verification failed or the caller hung up).</div>' : '<div class="summary">The score is computed when the caller finishes their account.</div>');
+
+    // comparison
+    const cmp = risk.comparison || [];
+    $("comparison").innerHTML = cmp.length ? `<table><tr><th>Item</th><th>On file</th><th>Stated</th><th></th></tr>${cmp.map(c =>
+      `<tr class="${c.ok === false ? "bad" : ""}"><td>${esc(c.label)}</td><td>${esc(c.on_file)}</td><td>${esc(c.stated)}</td><td class="${c.ok === false ? "bad" : c.ok ? "ok" : ""}">${c.ok === false ? "mismatch" : c.ok ? "match" : "—"}</td></tr>`).join("")}</table>`
+      : (d.policy ? `<div class="kv"><div>Holder</div><div>${esc(d.policy.holder_name)}</div><div>Vehicle</div><div>${esc(d.policy.vehicle.year + " " + d.policy.vehicle.make + " " + d.policy.vehicle.model + ", " + d.policy.vehicle.plate)}</div><div>Status</div><div>${esc(d.policy.status)}</div><div>Policy start</div><div>${esc(d.policy.policy_start)}</div></div>` : '<div class="summary">Available after verification.</div>');
+
+    // fields
+    const f = d.fields || {}; const order = ["policy_number", "full_name", "incident_date", "incident_time", "incident_location", "description", "vehicle", "other_party", "police_report", "injuries", "damage", "witnesses", "timeline_recap"];
+    $("fields").innerHTML = order.filter(k => f[k] != null).map(k => `<div>${k.replace(/_/g, " ")}</div><div>${esc(typeof f[k] === "object" ? fmtDate(f[k]) : String(f[k]))}</div>`).join("")
+      + (d.verification && d.verification.attempts ? `<div>failed attempts</div><div>${d.verification.attempts} (${esc(d.verification.failure_reason || "")})</div>` : "");
+
+    // click to focus a finding from either side
+    document.querySelectorAll("[data-f]").forEach(el => el.onclick = () => { focused = focused === +el.dataset.f ? null : +el.dataset.f; render(d); const first = document.querySelector(`.bubble.focus`); if (first) first.scrollIntoView({ block: "center", behavior: "smooth" }); });
+  }
+
+  function firstIntakeIndex(d) {
+    // first transcript line after verification succeeded: the "you're verified" greeting
+    const t = d.transcript || []; for (let i = 0; i < t.length; i++) if (t[i].role === "agent" && /you're verified|you’re verified|you are verified/i.test(t[i].text)) return i; return -1;
+  }
+  function fmtDate(o) { return o && o.year ? `${o.year}-${String(o.month).padStart(2, "0")}-${String(o.day).padStart(2, "0")}` : JSON.stringify(o); }
+  function loose(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim(); }
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+  poll();
+})();
+</script>
+</body>
+</html>
