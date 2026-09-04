@@ -103,17 +103,43 @@ agent = guava.Agent(
         "Collect the facts without leading the caller or suggesting answers. "
         "Never accuse the caller of anything, never mention fraud, risk, review, "
         "or suspicion, and never explain which verification detail was wrong. "
-        "If the caller offers payment card "
+        "Never answer questions about call recording, coverage, approval, timelines, or "
+        "anything outside the checklist from your own knowledge: always request the "
+        "answer from your expert and relay exactly what you are given. If the caller offers payment card "
         "or bank details, say nothing is charged on this call, ask them not to share "
         "those details, and do not repeat them."
     ),
 )
+
+# Fixed answers for questions the checklist does not cover. Plain strings so a
+# compliance reviewer can read and approve them. Anything else gets the default.
+RECORDING_DISCLOSURE = "This call may be recorded for accuracy and quality purposes."
+APPROVED_ANSWERS = [
+    (r"record|tap(e|ed|ing)|monitor", "Yes, calls to the claims line are recorded for accuracy and quality purposes."),
+    (r"how long|when will|time ?frame|how soon", "An adjuster contacts you within two business days of a claim being filed."),
+    (r"who (will|is going to) (call|contact)|who.*adjuster", "A Northwind claims adjuster will contact you directly."),
+    (r"what happens next|next step", "Once the report is complete, an adjuster reviews it and contacts you to arrange the next steps."),
+    (r"cover|deductible|pay ?out|how much|approved|approve", "I can't discuss coverage or approval on this call; the adjuster who contacts you can go through that with you."),
+]
+DEFAULT_ANSWER = "I can't answer that on this call, but the adjuster who contacts you will be able to."
+
+
+@agent.on_question
+def on_question(call: guava.Call, question: str) -> str:
+    import re
+    for pattern, answer in APPROVED_ANSWERS:
+        if re.search(pattern, question, re.I):
+            logger.info("Question answered from the approved list: %s", question)
+            return answer
+    logger.info("Question outside the approved list: %s", question)
+    return DEFAULT_ANSWER
 
 
 @agent.on_call_start
 def on_call_start(call: guava.Call):
     state = _state(call)
     logger.info("Call started (%s)", state.call_id)
+    call.read_script(RECORDING_DISCLOSURE)  # spoken word for word, before anything else
     start_verification(call)
     publish_live(state)
 
