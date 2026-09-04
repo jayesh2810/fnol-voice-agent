@@ -35,7 +35,7 @@ import guava
 from guava import logging_utils
 from guava.events import AgentSpeechEvent, BotSessionEnded, CallerSpeechEvent
 
-from fraud import analyze, check_turn
+from fraud import analyze, check_turn, live_rules, live_total
 from policies import verify_identity
 
 logger = logging.getLogger("fnol_agent")
@@ -70,6 +70,9 @@ class CallState:
     analysis: dict | None = None
     probes: list[dict] = field(default_factory=list)   # follow-ups asked live, and why
     last_probe_line: int = -100
+    fired_rules: set = field(default_factory=set)        # rule codes already counted live
+    ledger: list[dict] = field(default_factory=list)     # every score change, in order
+    live: dict = field(default_factory=lambda: {"score": 0, "confirmed": 0, "provisional": 0, "level": "low", "final": False})
     _timer: threading.Timer | None = None                # pending live check for the newest line
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -155,6 +158,7 @@ def on_verify_complete(call: guava.Call):
         state.fields.update({"policy_number": policy["policy_number"], "full_name": full_name, "date_of_birth": dob})
         state.phase = "intake"
         start_intake(call, policy)
+        recompute_live(call, state, line=len(state.transcript) - 1, publish=False)
         publish_live(state)
         return
 
@@ -291,6 +295,7 @@ def on_intake_complete(call: guava.Call):
 
     level, score = state.analysis["level"], state.analysis["score"]
     logger.info("Risk score %s (%s) -> %s", score, level, state.analysis["decision"])
+    finalize_live(state)
 
     if state.analysis["decision"] == "hold_for_review":
         # Claim is NOT written to the claims system. A human decides first.
@@ -329,6 +334,7 @@ def on_caller_speech(call: guava.Call, event: CallerSpeechEvent):
         "i": len(state.transcript), "role": "caller", "text": event.utterance,
         "time": _now(), "utterance_id": event.utterance_id,
     })
+    recompute_live(call, state, line=len(state.transcript) - 1, publish=False)
     publish_live(state)
     schedule_live_check(call, state)
 
@@ -339,14 +345,17 @@ def on_caller_speech(call: guava.Call, event: CallerSpeechEvent):
 # If so, the agent is nudged to ask one neutral follow-up before moving on.
 # The check runs off the event thread so the conversation is never held up.
 
+def _open_probe(state: CallState) -> dict | None:
+    return next((p for p in reversed(state.probes) if not p.get("resolved")), None)
+
+
 def schedule_live_check(call: guava.Call, state: CallState) -> None:
     if not LIVE_CHECKS or state.phase != "intake" or state.policy is None:
         return
-    if len(state.probes) >= MAX_PROBES_PER_CALL:
-        return
     line = state.transcript[-1]
-    if line["i"] - state.last_probe_line < PROBE_COOLDOWN_LINES:
-        return
+    can_probe = len(state.probes) < MAX_PROBES_PER_CALL and line["i"] - state.last_probe_line >= PROBE_COOLDOWN_LINES
+    if not can_probe and _open_probe(state) is None:
+        return  # nothing to ask and nothing to resolve
     # The speech system may still revise this line; wait a moment, then check the final text.
     if state._timer:
         state._timer.cancel()
@@ -357,28 +366,42 @@ def schedule_live_check(call: guava.Call, state: CallState) -> None:
 
 def run_live_check(call: guava.Call, state: CallState, line_index: int) -> None:
     try:
-        if state.phase != "intake" or len(state.probes) >= MAX_PROBES_PER_CALL:
+        if state.phase != "intake":
             return
         snapshot = list(state.transcript)
         latest = next((t for t in snapshot if t["i"] == line_index), None)
         if latest is None or latest["role"] != "caller":
             return
         fields_so_far = {k: call.get_field(k) for k in INTAKE_FIELDS if call.has_field(k)}
-        result = check_turn(state.policy, fields_so_far, snapshot, latest)
+        open_probe = _open_probe(state)
+        verdict = check_turn(state.policy, fields_so_far, snapshot, latest, open_probe)
+
+        if open_probe and verdict["resolves"]:
+            with state._lock:
+                open_probe["resolved"] = True
+                open_probe["resolved_line"] = line_index
+            add_ledger(state, line_index, -open_probe["points"], "cleared", open_probe["kind"],
+                       f"Follow-up answered clearly; {open_probe['kind']} no longer counts", provisional=True)
+            logger.info("Follow-up resolved at line %d", line_index)
+
+        result = verdict["probe"]
         if result is None:
+            recompute_live(call, state, line_index)
             return
         with state._lock:
             if len(state.probes) >= MAX_PROBES_PER_CALL or line_index - state.last_probe_line < PROBE_COOLDOWN_LINES:
+                recompute_live(call, state, line_index)
                 return
-            state.probes.append({**result, "time": _now()})
+            state.probes.append({**result, "time": _now(), "resolved": False})
             state.last_probe_line = line_index
+        add_ledger(state, line_index, result["points"], "live", result["kind"], result["reason"], provisional=True)
         logger.info("Eyebrow raised at line %d (%s): %s -> asking: %s", line_index, result["kind"], result["reason"], result["question"])
         call.send_instruction(
             "Before moving on to the next item, ask this one follow-up question in a warm, neutral "
             f"tone, exactly once: \"{result['question']}\" Do not say or imply that anything the "
             "caller said was wrong or inconsistent. Accept whatever they answer and continue."
         )
-        publish_live(state)
+        recompute_live(call, state, line_index)
     except Exception:
         logger.exception("Live check failed; ignoring")
 
@@ -390,7 +413,50 @@ def on_agent_speech(call: guava.Call, event: AgentSpeechEvent):
         "i": len(state.transcript), "role": "agent", "text": event.utterance,
         "time": _now(), "interrupted": event.interrupted,
     })
+    # Collected answers usually land just before the agent's next line, so check the rules here too.
+    recompute_live(call, state, line=len(state.transcript) - 1, publish=False)
     publish_live(state)
+
+
+# --- Live score --------------------------------------------------------------
+# Solid points come from rule checks on facts collected so far. Striped
+# ("provisional") points come from the live check and can be taken back when
+# a follow-up is answered clearly. The final review replaces the estimate.
+
+def add_ledger(state: CallState, line: int, delta: int, kind: str, code: str, label: str, provisional: bool) -> None:
+    state.ledger.append({"time": _now(), "line": line, "delta": delta, "kind": kind,
+                         "code": code, "label": label, "provisional": provisional})
+
+
+def recompute_live(call: guava.Call, state: CallState, line: int, publish: bool = True) -> None:
+    if state.policy is None or state.live.get("final"):
+        return
+    try:
+        fields = {k: call.get_field(k) for k in INTAKE_FIELDS if call.has_field(k)}
+        for finding in live_rules(state.policy, fields):
+            if finding["code"] not in state.fired_rules:
+                state.fired_rules.add(finding["code"])
+                add_ledger(state, line, finding["weight"], "rule", finding["code"], finding["explanation"], provisional=False)
+        confirmed = sum(e["delta"] for e in state.ledger if not e["provisional"])
+        provisional = max(0, sum(e["delta"] for e in state.ledger if e["provisional"]))
+        score, level = live_total(confirmed, provisional)
+        state.live = {"score": score, "confirmed": confirmed, "provisional": provisional, "level": level, "final": False}
+        if publish:
+            publish_live(state)
+    except Exception:
+        logger.exception("Live score update failed; ignoring")
+
+
+def finalize_live(state: CallState) -> None:
+    """The end-of-call review replaces the live estimate."""
+    final = state.analysis or {}
+    if final.get("score") is None:
+        return
+    delta = final["score"] - state.live.get("score", 0)
+    add_ledger(state, len(state.transcript) - 1, delta, "final", "final_review",
+               "Final review replaces the live estimate", provisional=False)
+    state.live = {"score": final["score"], "confirmed": final["score"], "provisional": 0,
+                  "level": final["level"], "final": True}
 
 
 # --- Saving the record -------------------------------------------------------
@@ -458,6 +524,7 @@ def build_record(state: CallState, termination_reason: str | None = None) -> dic
         "policy": policy_public,
         "fields": state.fields,
         "probes": state.probes,
+        "live": {**state.live, "ledger": state.ledger},
         "risk": {
             "score": analysis.get("score"),
             "level": analysis.get("level"),

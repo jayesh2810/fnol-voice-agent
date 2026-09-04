@@ -237,6 +237,27 @@ def run_llm_review(policy: dict, fields: dict, transcript: list[dict], probes: l
     return findings, dropped, incident_date, data.get("summary", ""), True
 
 
+# --- Live score: what can be known before the call ends -----------------------
+
+PROVISIONAL_POINTS = {"vague": 10, "contradiction": 20}   # "maybe" points from the live check
+
+
+def live_rules(policy: dict, fields: dict) -> list[dict]:
+    """Run only the rule checks whose inputs have been collected so far.
+
+    Same rules as run_rules, but a missing incident date is not a finding yet.
+    """
+    incident_date = parse_date(fields.get("incident_date")) if "incident_date" in fields else None
+    findings = run_rules(policy, fields, incident_date)
+    if "incident_date" not in fields:
+        findings = [x for x in findings if x["code"] != "incident_date_unclear"]
+    return findings
+
+
+def live_total(confirmed: int, provisional: int) -> tuple[int, str]:
+    return score_findings([{"weight": confirmed}, {"weight": provisional}])
+
+
 # --- Layer 2b: live "eyebrow" check, one caller line at a time ---------------
 # Runs during the call, right after the caller says something. It looks only at
 # the newest line against what came before and, if something is vague or does
@@ -249,16 +270,24 @@ _TURN_SCHEMA = {
         "kind": {"type": "string", "enum": ["none", "vague", "contradiction"]},
         "reason": {"type": "string"},
         "follow_up_question": {"type": "string"},
+        "resolves_open_follow_up": {"type": "boolean"},
     },
-    "required": ["suspicious", "kind", "reason", "follow_up_question"],
+    "required": ["suspicious", "kind", "reason", "follow_up_question", "resolves_open_follow_up"],
 }
 
 
-def _build_turn_prompt(policy: dict, fields: dict, transcript: list[dict], latest: dict) -> str:
+def _build_turn_prompt(policy: dict, fields: dict, transcript: list[dict], latest: dict, open_probe: dict | None = None) -> str:
     earlier = "\n".join(f"{t['role'].upper()}: {t['text']}" for t in transcript if t["i"] < latest["i"])
     v = policy["vehicle"]
+    open_note = ""
+    if open_probe:
+        open_note = f"""
+AN OPEN FOLLOW-UP QUESTION WAS JUST ASKED: "{open_probe['question']}" (because: {open_probe['reason']})
+If the newest caller line answers it clearly and specifically, set resolves_open_follow_up=true.
+If it dodges it or makes things less clear, set it false. Otherwise false.
+"""
     return f"""You are listening in on a live insurance claims call. Judge ONLY the caller's newest line.
-
+{open_note}
 Decide whether it deserves one gentle follow-up question right now. Say suspicious=true only if:
 - kind="vague": it is so vague or evasive that a claims handler could not act on it ("somewhere
   downtown", "it's complicated", "I'd rather not say") when a specific answer was asked for, OR
@@ -287,29 +316,34 @@ NEWEST CALLER LINE
 """
 
 
-def check_turn(policy: dict, fields: dict, transcript: list[dict], latest: dict) -> dict | None:
-    """Return a follow-up suggestion for the newest caller line, or None if it is fine.
+def check_turn(policy: dict, fields: dict, transcript: list[dict], latest: dict, open_probe: dict | None = None) -> dict:
+    """Judge the newest caller line.
 
-    Any failure (network, bad JSON) returns None: a live check must never disturb the call.
+    Returns {"probe": {...} or None, "resolves": bool}. "probe" is a follow-up
+    suggestion when the line is vague or contradictory; "resolves" is true when
+    the line clearly answers the open follow-up question, if there was one.
+    Any failure (network, bad JSON) returns an empty verdict: a live check must
+    never disturb the call.
     """
     from guava.helpers.llm import generate
 
+    empty = {"probe": None, "resolves": False}
     try:
-        raw = generate(_build_turn_prompt(policy, fields, transcript, latest), json_schema=_TURN_SCHEMA)
+        raw = generate(_build_turn_prompt(policy, fields, transcript, latest, open_probe), json_schema=_TURN_SCHEMA)
         data = json.loads(raw)
     except Exception:
         logger.exception("Live turn check failed")
-        return None
-    if not data.get("suspicious") or data.get("kind") not in ("vague", "contradiction"):
-        return None
-    if not data.get("follow_up_question", "").strip():
-        return None
-    return {
-        "line": latest["i"],
-        "kind": data["kind"],
-        "reason": data.get("reason", ""),
-        "question": data["follow_up_question"].strip(),
-    }
+        return empty
+    verdict = {"probe": None, "resolves": bool(open_probe) and bool(data.get("resolves_open_follow_up"))}
+    if data.get("suspicious") and data.get("kind") in ("vague", "contradiction") and data.get("follow_up_question", "").strip():
+        verdict["probe"] = {
+            "line": latest["i"],
+            "kind": data["kind"],
+            "reason": data.get("reason", ""),
+            "question": data["follow_up_question"].strip(),
+            "points": PROVISIONAL_POINTS[data["kind"]],
+        }
+    return verdict
 
 
 # --- Scoring and transcript highlighting -------------------------------------
