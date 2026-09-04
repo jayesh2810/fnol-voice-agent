@@ -260,9 +260,12 @@ def _build_turn_prompt(policy: dict, fields: dict, transcript: list[dict], lates
     return f"""You are listening in on a live insurance claims call. Judge ONLY the caller's newest line.
 
 Decide whether it deserves one gentle follow-up question right now. Say suspicious=true only if:
-- it is so vague that a claims handler could not act on it ("somewhere downtown", "it's complicated",
-  "I'd rather not say") when a specific answer was asked for, OR
-- it cannot both be true together with something the caller said EARLIER on this call.
+- kind="vague": it is so vague or evasive that a claims handler could not act on it ("somewhere
+  downtown", "it's complicated", "I'd rather not say") when a specific answer was asked for, OR
+- kind="contradiction": it states a fact that cannot be true together with a fact the caller
+  stated EARLIER on this call (a different day, place, vehicle, or sequence of events).
+A non-answer is "vague", never "contradiction". Use "contradiction" only when you can point to
+the earlier line it clashes with.
 
 Do NOT flag: short answers that are still specific ("no", "yes", "around 6pm"), approximate times,
 missing detail that was not asked for, nervous or informal phrasing, or an answer that simply adds
