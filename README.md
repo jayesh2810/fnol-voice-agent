@@ -1,208 +1,245 @@
 # Northwind FNOL Agent
 
-A voice agent that takes **First Notice of Loss (FNOL)** calls for an auto insurer
-and quietly scores each call for fraud signals while it talks to the customer.
-
-Built on the [Guava](https://goguava.ai) voice SDK.
-
-## What the caller experiences
-
-1. The agent greets them and asks for policy number, full name and date of birth.
-2. If the details match a policy on file, it collects the accident details.
-3. At the end it asks them to recap the sequence of events once more.
-4. It either reads out a claim number, or says a specialist will call back.
-
+A voice agent that takes **First Notice of Loss (FNOL)** calls for an auto
+insurer. It verifies the caller, collects the account of the accident, and
+scores the call for fraud signals while the conversation is still going. Claims
+that look fine are filed on the spot. Claims that do not are held for a person.
 The caller never hears the words fraud, risk, review or suspicion.
 
-## What happens behind the scenes
+Built on the [Guava](https://goguava.ai) voice platform. Guava handles the phone
+line, speech recognition, the conversation itself, and speech synthesis. This
+repository is the business logic that sits beside it, plus a local dashboard for
+watching calls live and reviewing them afterwards.
+
+## Contents
+
+- [What a call looks like](#what-a-call-looks-like)
+- [How it works](#how-it-works)
+- [Fraud signals](#fraud-signals)
+- [Safety and privacy](#safety-and-privacy)
+- [Running it](#running-it)
+- [The dashboard](#the-dashboard)
+- [Test customers](#test-customers)
+- [Call records](#call-records)
+- [Files](#files)
+- [Known limits and next steps](#known-limits-and-next-steps)
+
+## What a call looks like
+
+1. A recording disclosure is spoken first, word for word.
+2. The agent asks for policy number, full name and date of birth, and checks
+   them against the policy on file. One retry on a mismatch, then a polite
+   goodbye. It never says which detail was wrong.
+3. Once verified, it collects the accident details one question at a time:
+   date, time, place, what happened, vehicle, other parties, police, injuries,
+   damage, witnesses. Then it asks the caller to tell the sequence of events
+   once more from the start.
+4. If an answer is too vague to act on, or clashes with something said earlier,
+   the agent asks one neutral follow-up before moving on. At most two per call.
+5. At the end the call is scored. Low or medium risk: the claim is filed and a
+   claim number is read out. High risk: the caller is told a specialist will
+   call back within one business day, and nothing is filed.
+
+## How it works
 
 ```
-call starts
-   |
-   v
-VERIFY  -- policy number + name + DOB checked against policies.py
-   |         wrong?  one retry, then a polite goodbye (status: unverified)
-   v
-INTAKE  -- 11 fields collected, ending with a "tell me again from the start" recap
-   |
-   v
-ANALYZE -- fraud.py
-   |         layer 1: rules on hard facts (dates, status, claim history, vehicle)
-   |         layer 2: one LLM read of the transcript, quoting contradictions
-   |         -> risk score 0-100 and a level: low / medium / high
-   v
-DECIDE  -- low or medium: claim FILED, claim number read out
-   |         high:          claim HELD, not filed, specialist will call back
-   v
-SAVE    -- claims/<timestamp>_<call>.json with everything the dashboard needs
+Guava (cloud)                          This code (main.py)
+─────────────                          ───────────────────
+hears the caller, speaks the replies,  hands Guava each task and checklist
+runs each task's checklist             checks answers against the policy on file
+                          ──events──▶  scores the call, decides file or hold
+                          ◀─commands─  writes every line to claims/ for the dashboard
 ```
 
-### Why the claim is held instead of filed
+Guava calls into this code at a handful of moments: call started, a line was
+spoken, a checklist is complete, the caller asked a question, the call ended.
+Each moment has a handler in `main.py`. The handlers use three small modules:
 
-If a high-risk claim went straight into the claims system, an operator would
-later have to find and delete it. Holding it means a human looks first and
-nothing has to be undone.
+- `policies.py`: the customer records and the identity check.
+- `redact.py`: strips card, ID and security-code numbers from anything stored.
+- `fraud.py`: the rules, the transcript review, the live check, and the score.
 
-### Why the caller isn't told
-
-Someone who has just had an accident is stressed and gets details wrong
-innocently. Accusing an honest customer is worse than letting a reviewer
-spend five minutes on a false alarm. Automated denial or delay of a claim is
-also heavily regulated, so a person makes that call, never the bot.
+Audio never reaches this code. It works only with text, and it opens the
+connection to Guava itself, so it runs from a laptop behind any firewall.
 
 ## Fraud signals
 
-**Layer 1: rules** (`fraud.py`, `run_rules`). Deterministic, one sentence each.
+Three layers feed one score.
+
+**Rules on hard facts** (`fraud.py`, `run_rules`). Deterministic, one sentence each.
 
 | Code | Severity | Fires when |
 |---|---|---|
 | `policy_not_active` | high | policy is lapsed or cancelled |
 | `incident_before_policy_start` | high | incident date is before the policy began |
-| `incident_in_future` | medium | stated date is after today (probably misheard, still needs confirming) |
+| `incident_in_future` | medium | stated date is after today |
 | `recent_policy` | medium | incident within 30 days of policy start |
 | `claim_frequency` | medium | more than 1 claim in the last 12 months |
-| `vehicle_mismatch` | medium | described vehicle doesn't match make, model or plate on file |
-| `plate_mismatch` | medium | a plate was stated and it differs from the plate on file (notes how many characters differ) |
+| `vehicle_mismatch` | medium | described vehicle matches neither make, model nor plate on file |
+| `plate_mismatch` | medium | a plate was stated and differs from the plate on file, noting how many characters differ |
 | `injuries_without_police_report` | low | injuries reported but no police involvement |
-| `liability_only_coverage` | low | own-vehicle damage isn't covered; adjuster to confirm |
-| `llm_review_unavailable` | high | the LLM check didn't run, so a human must |
+| `liability_only_coverage` | low | own-vehicle damage is not covered; adjuster to confirm |
+| `llm_review_unavailable` | high | the transcript review did not run, so a person must |
 
-**Layer 2: LLM transcript review** (`fraud.py`, `run_llm_review`). One call to
-Guava's hosted model (`guava.helpers.llm.generate`) with a JSON schema, so no
-extra API key is needed. It is told to be conservative and to quote the
-caller's exact words for every finding. Categories: `contradiction`,
-`changed_story`, `vague_or_evasive`, `implausible_detail`, `other`.
+**Transcript review** (`fraud.py`, `run_llm_review`, `compare_recap`). One call
+to Guava's hosted model with a JSON schema, so no other API key is needed. It
+reads the whole transcript and reports contradictions, changed stories and
+evasive answers, quoting the caller's exact words for each. A finding the
+model itself marks as compatible (a colour or a street name added on the
+recap) is dropped, unless it concerns the core event: who hit whom, the
+direction of impact, moving or stopped, the order of events. The recap is
+also compared with the first account directly, with one question: can both
+be true?
 
-**Layer 2b: live follow-ups** (`fraud.py`, `check_turn`, wired in `main.py`).
-While the caller gives their account, each new caller line is checked in the
-background against everything said so far. If the line is too vague to act on
-or cannot be true alongside an earlier statement, the agent is nudged to ask
-one neutral, factual follow-up before moving on, for example "Just so I have
-it right, was that on Tuesday or on Wednesday?". Limits, all at the top of
-`main.py`: at most 2 follow-ups per call, never within 3 lines of the last
-one, never during identity checks, and the feature can be switched off with
-one flag. Every follow-up is recorded with its reason, and the end-of-call
-review is told about them so a clear correction counts in the caller's favour.
+**Live check** (`fraud.py`, `check_turn`, wired in `main.py`). After each
+caller line during the account, a background check asks whether the line is
+too vague to act on or cannot be true alongside an earlier one. If so, the
+agent is nudged to ask one neutral, factual follow-up, for example "Just so I
+have it right, was that on Tuesday or on Wednesday?". Limits sit at the top
+of `main.py`: two follow-ups per call, a cooldown between them, never during
+identity checks, one flag to switch it off. A clear answer to a follow-up
+takes its points back off.
 
-**Scoring.** low = 10, medium = 20, high = 60 points per finding, capped at 100.
-Score 30+ is medium, 60+ is high. So one high finding holds the claim on its own, and it takes three mediums to do the same. Thresholds live at the top of `fraud.py`.
+**Scoring.** Low 10, medium 20, high 60 points per finding, capped at 100.
+Under 30 is low, 30 to 59 medium, 60 and above high. One high finding holds a
+claim on its own; three mediums do the same. The decision is made only from
+the end-of-call score. The live score shown during the call is an estimate
+for the reviewer's screen and never changes what the caller hears.
 
-**Highlighting.** Each finding's quotes are matched back to transcript lines.
-Every transcript entry carries a `flags` list of finding indexes, so the
-dashboard can colour the suspicious lines without doing any text matching.
+## Safety and privacy
 
-## Test callers
-
-`policies.py` has five fake customers. Policy numbers are six digits so they
-can be spoken or keyed in.
-
-| Policy | Name | DOB | Vehicle | Designed to show |
-|---|---|---|---|---|
-| 100234 | Maria Lopez | 1988-04-12 | 2021 Toyota Camry, 7ABC123 | clean baseline, should file |
-| 100571 | James Carter | 1975-11-30 | 2019 Ford F-150, 8XYZ456 | policy started 9 days ago |
-| 100892 | Priya Nair | 1992-07-08 | 2022 Honda Civic, 5KLM789 | 2 prior claims this year |
-| 101347 | Daniel Kim | 1983-02-19 | 2018 Subaru Outback, 3QRS246 | policy lapsed, should hold |
-| 101605 | Aisha Rahman | 1996-09-25 | 2020 Hyundai Elantra, 6TUV135 | liability-only cover |
-
-Suggested scenarios:
-
-- **Honest call.** Maria Lopez, consistent story. Expect low risk and a claim number.
-- **Wrong identity.** Any policy with a wrong date of birth twice. Expect a polite goodbye and a JSON with `status: unverified`.
-- **Changed story.** Maria Lopez, say the accident was Tuesday, then say Wednesday in the recap. Expect an LLM `contradiction` finding with her words quoted.
-- **Stacked signals.** Daniel Kim, driving "a BMW", injuries yes, police no. Expect high risk, claim held.
+- **Nothing is disclosed before verification**, and a failed check never says
+  which detail was wrong.
+- **Questions outside the checklist** go to a handler with a short approved
+  list of answers (recording, timelines, who will call, next steps). Anything
+  else gets a fixed "the adjuster who contacts you can answer that". The agent
+  is instructed never to answer such questions from its own knowledge.
+- **Volunteered payment or ID numbers** are declined by the agent and scrubbed
+  from every stored line and answer by `redact.py` before anything is written
+  or sent to the review model.
+- **Held claims are not written to any claims system.** A person decides
+  first, so nothing has to be undone.
+- **The caller is never accused.** Follow-ups ask for a fact and nothing else.
+  Automated denial or delay of a claim is heavily regulated; that call is a
+  person's, never the agent's.
 
 ## Running it
 
-```bash
-cd appointment-reminder
-python main.py --chat            # type instead of talk, fastest for testing
-python main.py                   # talk through your laptop mic
-python main.py --webrtc          # browser link
-python main.py --phone +1555...  # answer a real number
-```
-
-`guava run` from this folder does the same as `python main.py`.
-
-## Live dashboard
+Requirements: Python 3.11 or newer, the [Guava CLI](https://goguava.ai/docs/quickstart),
+and a Guava account.
 
 ```bash
-python dashboard.py          # then open http://localhost:8787
+git clone https://github.com/jayesh2810/fnol-voice-agent.git
+cd fnol-voice-agent
+guava login                       # opens a browser once
+uv sync                           # or: python -m venv .venv && .venv/bin/pip install guava-sdk
 ```
 
-Run it in a second terminal next to the agent. It needs nothing beyond the
-Python standard library.
+Then, with the environment activated:
 
-- **While a call is live** the transcript appears line by line, with a marker
-  when identity is verified and the phase shown in the header (verifying,
-  taking the account, scoring, ended).
-- **When the call ends** the score, level and decision appear, every flagged
-  line is highlighted (amber for low/medium, red for high) with a chip showing
-  how many points it added, and the side panel lists what moved the score:
-  each finding with its points and quoted evidence, LLM findings that were
-  judged compatible and counted for nothing, and every rule that passed.
-- **Policy vs. statements** shows the vehicle, incident date, policy status,
-  claim history and coverage side by side, with mismatches in red.
-- **The score moves during the call.** Solid points come from rule checks the
-  moment their facts are collected (a lapsed policy shows at verification, a
-  vehicle mismatch the moment the car is described). Striped points come from
-  the live check and are taken back when a follow-up is answered clearly. Each
-  change appears as a tag under the line that caused it and in a running ledger.
-  The final review replaces the estimate when the account is complete; the
-  file-or-hold decision is made only from that final score.
-- **Follow-ups asked live** appear in the transcript under the line that
-  triggered them, with the reason, and in their own panel on the right.
-- **Past calls** can be picked from the dropdown in the header.
+```bash
+python main.py --chat             # type instead of talk; fastest for testing
+python main.py                    # talk through the laptop microphone
+python main.py --webrtc           # prints a browser link
+python main.py --phone +1555...   # answer calls on a number from your Guava account
+```
 
-How it works: the agent writes `claims/live.json` after every spoken line
-(atomically, so the page never reads a half-written file), and the page polls
-it once a second. Nothing else is needed, no websockets and no database.
+`guava run` from this folder is equivalent to `python main.py`. The agent
+answers only while the process is running; for an always-on number, deploy
+with `guava deploy up` or run it on a server.
 
-## Output for the dashboard
+## The dashboard
 
-One file per call in `claims/`. Shape:
+```bash
+python dashboard.py               # then open http://localhost:8787
+```
+
+Run it in a second terminal. It needs only the Python standard library.
+
+- **During a call**: the transcript appears line by line, with the current
+  phase in the header. The score bar fills as facts arrive: solid for rule
+  points, striped for provisional points from the live check. Each change is
+  tagged under the line that caused it, and a running ledger lists them all.
+- **After a call**: the final score, level and decision; every flagged line
+  highlighted with the points it added; each finding with its quoted evidence;
+  findings judged compatible and counted for nothing; every rule that passed;
+  and a side-by-side of the policy on file against what the caller said.
+- **Past calls** can be opened from the dropdown in the header.
+
+The agent writes `claims/live.json` after every spoken line, atomically, and
+the page polls it once a second. No websockets, no database.
+
+## Test customers
+
+`policies.py` holds five sample customers. Each exists to trigger one signal.
+
+| Policy | Name | Date of birth | Vehicle | Designed to show |
+|---|---|---|---|---|
+| 100234 | Maria Lopez | 1988-04-12 | 2021 Toyota Camry, 7ABC123 | clean baseline, files |
+| 100571 | James Carter | 1975-11-30 | 2019 Ford F-150, 8XYZ456 | policy only days old |
+| 100892 | Priya Nair | 1992-07-08 | 2022 Honda Civic, 5KLM789 | two prior claims this year |
+| 101347 | Daniel Kim | 1983-02-19 | 2018 Subaru Outback, 3QRS246 | lapsed policy, holds |
+| 101605 | Aisha Rahman | 1996-09-25 | 2020 Hyundai Elantra, 6TUV135 | liability-only cover |
+
+A quick tour: call as Maria with a consistent story and expect a claim number.
+Call again and tell a different story on the recap and expect a hold. Call as
+Daniel and expect a hold with no reason given.
+
+## Call records
+
+One JSON file per call in `claims/`, git-ignored. The main sections:
 
 ```jsonc
 {
-  "call_id": "...",
-  "started_at": "...", "ended_at": "...", "termination_reason": "...",
   "status": "filed | held_for_review | unverified | abandoned",
   "claim_number": "CLM-XXXXXX or null",
-  "verification": { "attempts": 0, "failure_reason": null },
-  "policy": { "policy_number": "...", "holder_name": "...", "vehicle": {...}, ... },   // no DOB
-  "fields": { "incident_date": "...", "description": "...", "timeline_recap": "...", ... },
+  "verification": { "attempts": 0, "failure_reason": null, "last_heard": null },
+  "policy": { "...": "the record on file, minus date of birth" },
+  "fields": { "...": "every collected answer, redacted" },
+  "probes": [ { "line": 14, "kind": "vague", "question": "...", "resolved": true } ],
+  "live": { "score": 40, "ledger": [ { "delta": 20, "code": "recent_policy", "provisional": false } ] },
   "risk": {
     "score": 40, "level": "medium", "decision": "file",
-    "findings": [
-      { "source": "rule|llm", "code": "...", "severity": "...", "weight": 20,
-        "explanation": "...", "quotes": ["caller's exact words"] }
-    ],
-    "llm_summary": "...", "llm_review_ok": true,
-    "thresholds": { "medium": 30, "high": 60 }
+    "findings": [ { "source": "rule | llm", "code": "...", "weight": 20, "explanation": "...", "quotes": ["..."] } ],
+    "dropped": [], "checks": [], "comparison": [], "llm_review_ok": true
   },
-  "transcript": [
-    { "i": 0, "role": "agent",  "text": "...", "time": "...", "flags": [] },
-    { "i": 1, "role": "caller", "text": "...", "time": "...", "flags": [0] }   // points at findings[0]
-  ]
+  "transcript": [ { "i": 1, "role": "caller", "text": "...", "flags": [0] } ]
 }
 ```
+
+`flags` on a transcript line point at the findings that quote it.
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `main.py` | the agent: tasks, checklists, event handlers, saving |
-| `fraud.py` | rules, LLM review, scoring, transcript highlighting |
-| `policies.py` | fake policy data, identity matching, date parsing |
+| `main.py` | the agent: tasks, checklists, handlers, live score, saving |
+| `fraud.py` | rules, transcript review, recap comparison, live check, scoring |
+| `policies.py` | sample policy records, identity matching, date parsing |
+| `redact.py` | scrubs card, ID and security-code numbers before anything is stored |
 | `dashboard.py` | local web server for the review page |
-| `dashboard.html` | the review page: live transcript, score, highlights |
+| `dashboard.html` | the review page |
 | `claims/` | one JSON per call, plus `live.json` for the call in progress |
 
-## Known limits
+## Known limits and next steps
 
-- Speech-to-text can mishear names and dates. Name matching is fuzzy and dates are
-  parsed leniently, but a real deployment would confirm by reading back.
-- The live follow-up check costs one helper-model call per caller line during the
-  account. Fine for a prototype; a production version would batch or throttle it.
-- Fake data lives in a Python dictionary. Swap `find_policy` for a real API call.
-- Guava's hosted LLM endpoint is convenient for a prototype. For production in a
-  regulated setting you would confirm where that data is processed and retained.
+- **No hand-off to a person yet.** A caller who asks for a human is told the
+  adjuster will follow up. A transfer action or a callback request is the next
+  thing to add.
+- **The live check is too eager on honest callers.** It sometimes asks a
+  needless confirmation because it compares the caller against the policy file
+  rather than against the caller's own earlier lines. It stays polite and the
+  points come off, but it should compare caller with caller only.
+- **Third-party callers are not handled.** A friend or relative reporting on
+  the policyholder's behalf either fails verification or, with the holder's
+  details, passes as the holder. A "who am I speaking with" step and a
+  third-party report path are planned.
+- **Answers are saved only when the account completes.** A call that ends
+  early keeps its transcript but not the collected answers.
+- **Relative dates.** "It happened just now" leads the agent to ask for the
+  date rather than knowing it. Giving the agent today's date at call start
+  would fix this.
+- **Sample data lives in a dictionary.** Replace `find_policy` with a real
+  lookup for production.
+- **Guava's hosted model** is convenient here. For a regulated deployment,
+  confirm where transcript data is processed and retained.
