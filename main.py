@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -585,6 +586,20 @@ def _merge_flags(live: list[dict], analyzed: list[dict]) -> list[dict]:
 
 # --- Entry point -------------------------------------------------------------
 
+def hosted_by_guava() -> bool:
+    """True when running inside a `guava deploy up` deployment (no mic, no terminal)."""
+    from guava.auth import GUAVA_DEPLOY_TOKEN_PATH
+    return GUAVA_DEPLOY_TOKEN_PATH.exists()
+
+
+def account_phone_number() -> str:
+    """The phone number attached to this Guava account. Set GUAVA_AGENT_NUMBER to choose one explicitly."""
+    numbers = guava.Client().list_numbers()
+    if not numbers:
+        raise SystemExit("No phone number on this Guava account. Buy one with `guava numbers buy` or set GUAVA_AGENT_NUMBER.")
+    return numbers[0].phone_number
+
+
 if __name__ == "__main__":
     logging_utils.configure_logging()
 
@@ -602,5 +617,9 @@ if __name__ == "__main__":
         agent.listen_webrtc()
     elif args.phone:
         agent.listen_phone(args.phone)
+    elif os.environ.get("GUAVA_AGENT_NUMBER"):
+        agent.listen_phone(os.environ["GUAVA_AGENT_NUMBER"])
+    elif hosted_by_guava():
+        agent.listen_phone(account_phone_number())  # `guava deploy up` starts us with no arguments
     else:
         agent.call_local()
